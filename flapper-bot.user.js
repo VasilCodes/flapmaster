@@ -6,10 +6,20 @@
 // @author       zavko & limerence
 // @match        https://greenpump.xyz/flappy*
 // @grant        none
+// @run-at       document-start
 // ==/UserScript==
 
 (function() {
     'use strict';
+
+    // Inject willReadFrequently BEFORE any page script calls getContext.
+    const _origGetContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function(type, attrs) {
+        if (type === '2d') {
+            attrs = Object.assign({}, attrs || {}, { willReadFrequently: true });
+        }
+        return _origGetContext.call(this, type, attrs);
+    };
 
     window.Flapper = { showPanel: null, getConfig: null, name: 'FlapMaster' };
 
@@ -973,13 +983,13 @@
         log('FlapMaster v7.1 initializing...');
         canvas = findCanvas();
         if (canvas) {
-            ctx = canvas.getContext('2d', { willReadFrequently: true });
+            ctx = canvas.getContext('2d');
             log(`Canvas: ${canvas.width}x${canvas.height}`);
         } else {
             log('Canvas not found - retrying...');
             setTimeout(() => {
                 canvas = findCanvas();
-                if (canvas) ctx = canvas.getContext('2d', { willReadFrequently: true });
+                if (canvas) ctx = canvas.getContext('2d');
             }, 2000);
         }
         createPanel();
