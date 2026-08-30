@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FlapMaster – Auto-Flap Bot (GreenPump)
 // @namespace    http://tampermonkey.net/
-// @version      6.5
+// @version      7.0
 // @description  Auto-flap bot. Detects bird position via canvas, flaps and cashes out with keyboard simulation.
 // @author       zavko & limerence
 // @match        https://greenpump.xyz/flappy*
@@ -79,91 +79,163 @@
     const PIPE_TARGET_GRACE_MS = 800;
 
     // ==================== BOT CORE ====================
-    // The same planner used in test_simulation.html.
-    //
-    // Old algorithm aimed at "40% from top of safe zone" which was fatally
-    // wrong: one flap rises jumpForce²/(2*gravity) ≈ 66px, the band is
-    // only 88px, and flapping at 40% from top always punches through the
-    // ceiling. The fix: a short-horizon planner that simulates "flap now"
-    // vs "coast now" and picks whichever survives longer.
-    const PLAN_HORIZON = 200;
-    const BAND_MARGIN  = 4;
+    // Dead-simple approach based on how working Flappy Bird bots work:
+    // 1. Scan ONE row near y=0 for non-sky pixels = pipe columns
+    // 2. Scan DOWN each pipe column to find where pipe stops = gap
+    // 3. If bird is below gap center → flap
+    // That's it. No planner, no heuristics. Just detection + simple rule.
 
     function riseHeight(d) {
         return (d.jumpForce * d.jumpForce) / (2 * d.gravity);
     }
 
-    // Cheap fallback policy: oscillation centred on the gap centre.
-    function heurFlap(birdY, birdVY, pipesAhead, d) {
-        // Ground emergency — always flap
-        if (birdY > GROUND_Y - BIRD_RADIUS - 40) return true;
+    // Is this pixel sky-colored? Sky in greenpump is cyan gradient:
+    // #4ec0ca (78,204,202) to #8edde4 (142,221,228)
+    // Sky = high R, high G, high B, and G≈R (cyan).
+    function isSky(r, g, b) {
+        const brightness = (r + g + b) / 3;
+        // Sky is bright and cyan-ish: all channels > 120, G and R close
+        if (brightness > 140 && g > 120 && b > 120 && Math.abs(g - r) < 80) return true;
+        return false;
+    }
 
-        // No pipes detected: be CONSERVATIVE. Only flap when falling
-        // below the lower third of the play area. This avoids the
-        // "spam upwards" problem where the bot flaps every frame
-        // because the bird is above the screen centre.
+    // Is this pixel pipe-colored? Pipe stripes are bright green where G >> R.
+    function isPipe(r, g, b) {
+        // Bright pipe stripe: green dominates red
+        if (g > r + 20 && g > 50) return true;
+        // Dark pipe outline: very dark and greenish
+        if (r < 80 && g < 120 && g > r && (r + g + b) / 3 < 80) return true;
+        return false;
+    }
+
+    // Scan ONE horizontal line near the top of the canvas for pipe columns.
+    // Returns array of x positions where pipes exist.
+    function findPipeXPositions(imageData, w) {
+        const data = imageData.data;
+        const scanY = 5; // near top edge
+        let pipeXs = [];
+        let inPipe = false;
+        let pipeStart = 0;
+
+        for (let x = 0; x < w - 5; x++) {
+            const idx = (scanY * w + x) * 4;
+            const r = data[idx], g = data[idx+1], b = data[idx+2];
+            const pipe = isPipe(r, g, b) && !isSky(r, g, b);
+
+            if (pipe && !inPipe) {
+                pipeStart = x;
+                inPipe = true;
+            } else if (!pipe && inPipe) {
+                // End of pipe region - use the center x
+                const centerX = (pipeStart + x) / 2;
+                if (x - pipeStart > 10) { // pipe must be at least 10px wide
+                    pipeXs.push(centerX);
+                }
+                inPipe = false;
+            }
+        }
+        if (inPipe) {
+            const centerX = (pipeStart + w - 5) / 2;
+            if (w - 5 - pipeStart > 10) pipeXs.push(centerX);
+        }
+        return pipeXs;
+    }
+
+    // Given a pipe's x position, scan DOWN to find the gap.
+    // Returns { gapTop, gapBottom } or null.
+    function findPipeGap(imageData, w, pipeX, groundY) {
+        const data = imageData.data;
+        // Scan a few columns around pipeX and merge results
+        let allPipeY = new Set();
+
+        for (let dx = -5; dx <= 5; dx += 2) {
+            const x = Math.round(pipeX + dx);
+            if (x < 0 || x >= w) continue;
+
+            for (let y = 0; y < groundY; y++) {
+                const idx = (y * w + x) * 4;
+                const r = data[idx], g = data[idx+1], b = data[idx+2];
+                if (isPipe(r, g, b)) {
+                    allPipeY.add(y);
+                }
+            }
+        }
+
+        if (allPipeY.size < 10) return null;
+
+        let sorted = [...allPipeY].sort((a, b) => a - b);
+
+        // Find the largest gap (continuous region with no pipe pixels)
+        let bestGapTop = 0, bestGapBot = groundY, bestGapSize = 0;
+        let gapStart = sorted[0];
+
+        for (let i = 1; i < sorted.length; i++) {
+            if (sorted[i] - sorted[i-1] > 15) {
+                // Gap between sorted[i-1] and sorted[i]
+                const gapTop = sorted[i-1];
+                const gapBot = sorted[i];
+                const gapSize = gapBot - gapTop;
+                if (gapSize > bestGapSize) {
+                    bestGapSize = gapSize;
+                    bestGapTop = gapTop;
+                    bestGapBot = gapBot;
+                }
+            }
+        }
+
+        if (bestGapSize < 40) return null; // real gaps are 91-114px
+
+        return { gapTop: bestGapTop, gapBottom: bestGapBot, gapCenter: (bestGapTop + bestGapBot) / 2 };
+    }
+
+    // Detect the bird by scanning a narrow strip around x=90-150 for
+    // non-sky, non-pipe pixels (the bird sprite).
+    function readBirdSample() {
+        if (!canvas || !ctx) return null;
+        try {
+            const scanX = 90, scanW = 60;
+            const imageData = ctx.getImageData(scanX, 0, scanW, canvas.height);
+            const data = imageData.data;
+            let birdPixels = [];
+
+            for (let x = 0; x < scanW; x++) {
+                for (let y = 50; y < GROUND_Y; y += 2) {
+                    const idx = (y * scanW + x) * 4;
+                    const r = data[idx], g = data[idx+1], b = data[idx+2];
+                    if (!isSky(r, g, b) && !isPipe(r, g, b)) {
+                        birdPixels.push({ x: scanX + x, y });
+                    }
+                }
+            }
+
+            if (birdPixels.length < 5 || birdPixels.length > 2000) return null;
+
+            let sumX = 0, sumY = 0;
+            for (const p of birdPixels) { sumX += p.x; sumY += p.y; }
+            return { x: sumX / birdPixels.length, y: sumY / birdPixels.length, size: birdPixels.length };
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // The flap decision: if bird is below the gap center, flap.
+    function botShouldFlap(birdY, birdVY, pipesAhead, d) {
+        if (birdY > GROUND_Y - BIRD_RADIUS - 40) return true; // ground emergency
+
         let pipe = null;
         for (const p of pipesAhead) {
-            if (p.x > state.bird.x - 30) { pipe = p; break; }
+            if (p.x > (state.bird.x || 120) - BIRD_RADIUS) { pipe = p; break; }
         }
         if (!pipe) {
-            const playHeight = GROUND_Y - 60; // approximate playable height
-            return birdVY >= 0 && birdY > 60 + playHeight * 0.65;
+            // No pipe visible — maintain altitude: flap when falling below mid-screen
+            return birdVY >= 0 && birdY > GROUND_Y * 0.55;
         }
 
-        const bandTop = (pipe.gapTop || pipe.topH) + BIRD_RADIUS + BAND_MARGIN;
-        const bandBot = (pipe.gapBottom || pipe.botY) - BIRD_RADIUS - BAND_MARGIN;
-        const gapCenter = ((pipe.gapTop || pipe.topH) + (pipe.gapBottom || pipe.botY)) / 2;
-        let fp = gapCenter + riseHeight(d) * 0.5;
-        if (fp > bandBot) fp = bandBot;
-        if (fp < bandTop + 2) fp = bandTop + 2;
-        return birdY > fp && birdVY >= 0;
-    }
-
-    // Simulate forward. First frame uses firstAction, then falls back to
-    // heurFlap. Returns {frames survived, pipes passed}.
-    function rolloutFlapAt(y, vy, pipesAhead, d, spd, firstAction, horizon) {
-        let py = y, pvy = vy, passed = 0;
-        const birdX = state.bird.x || 120;
-        const px = pipesAhead.map(p => ({
-            x: p.x,
-            topH: p.gapTop || p.topH,
-            botY: p.gapBottom || p.botY,
-            passed: false
-        }));
-        for (let i = 0; i < horizon; i++) {
-            const act = (i === 0) ? firstAction : heurFlap(py, pvy, px, d);
-            if (act) pvy = d.jumpForce;
-            pvy = Math.min(d.maxFallSpeed, pvy + d.gravity);
-            py += pvy;
-            if (py + BIRD_RADIUS >= GROUND_Y) return { frames: i, passed };
-            if (py - BIRD_RADIUS <= 0) { py = BIRD_RADIUS; pvy = 0; }
-            for (const p of px) p.x -= spd;
-            for (const p of px) {
-                if (birdX + BIRD_RADIUS > p.x && birdX - BIRD_RADIUS < p.x + PIPE_WIDTH &&
-                    (py - BIRD_RADIUS < p.topH || py + BIRD_RADIUS > p.botY))
-                    return { frames: i, passed };
-            }
-            for (const p of px) {
-                if (!p.passed && birdX > p.x + PIPE_WIDTH) { p.passed = true; passed++; }
-            }
-        }
-        return { frames: horizon, passed };
-    }
-
-    // The actual decision: try flap-now and coast-now, keep whichever
-    // survives longer. This fixes the phase problem that a fixed threshold
-    // can't solve — 66px rise in an 88px band demands proper planning.
-    function botShouldFlap(birdY, birdVY, pipesAhead, d, spd) {
-        const ahead = pipesAhead.filter(p => p.x > state.bird.x - 30);
-        const f = rolloutFlapAt(birdY, birdVY, ahead, d, spd, true, PLAN_HORIZON);
-        const c = rolloutFlapAt(birdY, birdVY, ahead, d, spd, false, PLAN_HORIZON);
-        if (f.frames === PLAN_HORIZON && c.frames === PLAN_HORIZON) {
-            return heurFlap(birdY, birdVY, ahead, d);
-        }
-        if (f.frames !== c.frames) return f.frames > c.frames;
-        if (f.passed !== c.passed) return f.passed > c.passed;
-        return heurFlap(birdY, birdVY, ahead, d);
+        // Flap when bird is below the gap center (with small offset)
+        // The rise per flap is ~66px, gap is ~100px, so this creates
+        // a gentle oscillation through the gap.
+        const target = pipe.gapCenter - 5; // aim slightly above center
+        return birdY > target && birdVY >= 0;
     }
 
     // Physics constants (EXACT from source)
@@ -325,244 +397,67 @@
         return false;
     }
 
-    // ==================== BIRD POSITION (Canvas) ====================
-    // The bird is a pixel-art sprite (loaded from /flappy-bird.png) with
-    // MULTIPLE shades of green (bright lime to dark green), a white eye,
-    // and a black outline. The old detection only matched the very brightest
-    // green (G>180) which was too strict — the cluster never reached the
-    // 15px minimum, so detection always returned null.
-    //
-    // New approach: match ANY green-dominant pixel (G>R and G>100) in the
-    // left half of the canvas. The bird is the only green object there
-    // during gameplay (bushes/trees are far left/bottom and much larger).
-    // Filter by cluster size: bird is ~500-2000px, bushes are 5000+.
-    function readBirdSample() {
-        if (!canvas || !ctx) return null;
-
-        try {
-            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-            const data = imageData.data;
-            const w = canvas.width;
-            const h = canvas.height;
-
-            let clusters = [];
-            let visited = new Uint8Array(w * h);
-
-            // Scan the left half of the canvas, excluding ground and top sky.
-            // Step by 2px for better cluster connectivity than the old 3px.
-            for (let y = 40; y < h - 80; y += 2) {
-                for (let x = 30; x < w * 0.5; x += 2) {
-                    const idx = (y * w + x) * 4;
-                    const r = data[idx], g = data[idx+1], b = data[idx+2];
-
-                    // Bird-dominant green: any pixel where green channel
-                    // dominates red AND is reasonably bright. This catches
-                    // all shades of the sprite (bright highlights through
-                    // medium body greens) while excluding sky (blue-heavy),
-                    // pipes (darker/different hue), ground (brown), and the
-                    // black outline.
-                    if (g < 100 || g <= r || (g - r) < 20) continue;
-                    if (visited[y * w + x]) continue;
-
-                    // Flood-fill cluster — allow up to 3000px (bird sprite
-                    // with surrounding green pixels). Bushes/trees are 5000+.
-                    let pixels = [];
-                    let stack = [[x, y]];
-                    while (stack.length > 0 && pixels.length < 3000) {
-                        const [cx, cy] = stack.pop();
-                        if (cx < 0 || cx >= w || cy < 0 || cy >= h) continue;
-                        const ci = (cy * w + cx) * 4;
-                        if (visited[cy * w + cx]) continue;
-                        const cr = data[ci], cg = data[ci+1], cb = data[ci+2];
-                        if (cg < 100 || cg <= cr || (cg - cr) < 20) continue;
-                        visited[cy * w + cx] = 1;
-                        pixels.push({ x: cx, y: cy });
-                        stack.push([cx+2, cy], [cx-2, cy], [cx, cy+2], [cx, cy-2]);
-                    }
-
-                    // Bird cluster: 30-2500 pixels
-                    // (bushes/trees are 5000+, pipes are vertical and far right)
-                    if (pixels.length >= 30 && pixels.length <= 2500) {
-                        let sumX = 0, sumY = 0;
-                        for (const p of pixels) { sumX += p.x; sumY += p.y; }
-                        clusters.push({
-                            x: sumX / pixels.length,
-                            y: sumY / pixels.length,
-                            size: pixels.length
-                        });
-                    }
-                }
-            }
-
-            if (clusters.length === 0) return null;
-
-            // Pick the cluster closest to the bird's last known Y (falls back
-            // to canvas center on the very first sample). This is more stable
-            // than "closest to center" once the bird has moved.
-            const anchorY = state.bird.hasSample ? state.bird.y : h / 2;
-            clusters.sort((a, b) => Math.abs(a.y - anchorY) - Math.abs(b.y - anchorY));
-            const best = clusters[0];
-
-            debugLog(`Bird sample: (${best.x.toFixed(0)}, ${best.y.toFixed(0)}) size=${best.size} [${clusters.length} clusters]`);
-            return { x: best.x, y: best.y, size: best.size, clusterCount: clusters.length };
-        } catch (e) {
-            debugLog(`Canvas error: ${e.message}`);
-            return null;
-        }
-    }
-
     // ==================== BIRD PHYSICS ====================
-    // Treats the bird as a real object on the y-axis: a position + velocity
-    // that gets integrated by gravity every frame, and corrected (not
-    // replaced) by whatever the canvas scan sees. On a flap we set the
-    // velocity to the known jump force immediately, instead of waiting for a
-    // noisy pixel sample to "catch up" - this is what stops the bot from
-    // repeatedly re-flapping while it's already rising (the bug that made
-    // the bird just rocket to the ceiling and stay there).
     function updateBirdPhysics(sample, difficultyConfig) {
         const bird = state.bird;
 
         if (sample) {
             if (bird.hasSample) {
-                // Raw per-frame velocity estimate from the movement of the
-                // sample. Smoothed (EMA) so one noisy read can't cause a
-                // spike that flips the flap decision for a whole frame.
-                const rawVy = sample.y - bird.y;
-                bird.vy = bird.vy * 0.5 + rawVy * 0.5;
+                bird.vy = bird.vy * 0.5 + (sample.y - bird.y) * 0.5;
             }
-            // Blend toward the fresh reading rather than snapping straight to
-            // it - keeps the tracked position smooth even if a single scan
-            // is a few pixels off.
-            bird.y = bird.hasSample ? (bird.y * 0.5 + sample.y * 0.5) : sample.y;
+            bird.y = bird.hasSample ? (bird.y * 0.6 + sample.y * 0.4) : sample.y;
             bird.x = sample.x;
             bird.hasSample = true;
-            debugLog(`Bird sample: (${sample.x.toFixed(0)}, ${sample.y.toFixed(0)}) -> y=${bird.y.toFixed(1)} vy=${bird.vy.toFixed(1)} [${sample.size}px, ${sample.clusterCount} clusters]`);
         } else if (bird.hasSample) {
-            // No sample this frame - keep the bird "alive" as a real falling
-            // object instead of freezing in place or guessing randomly.
             bird.vy = Math.min(bird.vy + difficultyConfig.gravity, difficultyConfig.maxFallSpeed);
             bird.y += bird.vy;
         }
     }
 
-    // ==================== PIPE DETECTION (Canvas) ====================
-    // REAL GAME pipe colors (from 41qzff47zxjhm.js source):
-    //   #a3e048 (163,224,72) — brightest stripe
-    //   #8cd600 (140,214,0)  — second stripe
-    //   #73bf2e (115,191,46) — middle stripe
-    //   #558b2f (85,139,47)  — darker stripe
-    //   #3d661b (61,102,27)  — very dark stripe
-    //   #2e5200 (46,82,0)    — outline/stroke
-    // Sky: #4ec0ca → #8edde4 (cyan, R≈G high, B high)
-    // Pipe = greenish (G >> R) and not cyan (B not too high relative to G).
-    // Key insight: sky has G≈R (both ~200), pipes have G >> R.
+    // ==================== PIPE DETECTION ====================
+    // Simple approach: scan top row for pipe columns, then scan down for gaps.
     function readPipes() {
         if (!canvas || !ctx) return [];
-
         try {
             const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-            const data = imageData.data;
             const w = canvas.width;
-            const groundY = GROUND_Y;
 
-            const birdX = state.bird.x || 120;
-            const scanStart = Math.max(birdX - BIRD_RADIUS - 5, 30);
-
-            // For each x, collect y-positions of pipe-colored pixels.
-            let colData = [];
-            for (let x = scanStart; x < w - 5; x += 3) {
-                let pipeYs = [];
-                for (let y = 30; y < groundY; y += 2) {
-                    const idx = (y * w + x) * 4;
-                    const r = data[idx], g = data[idx+1], b = data[idx+2];
-
-                    // Bright pipe stripe: green dominates red by 30+
-                    const isGreenish = g > r + 30 && g > 60 && r < 180;
-                    // Dark outline: very dark and greenish
-                    const isDarkGreen = r < 70 && g < 110 && g > r && (g + r + b) / 3 < 70;
-
-                    if (isGreenish || isDarkGreen) {
-                        pipeYs.push(y);
-                    }
+            // Step 1: find pipe x-positions by scanning y=5
+            const pipeXs = findPipeXPositions(imageData, w);
+            if (pipeXs.length === 0) {
+                // Grace period
+                const now = Date.now();
+                if (now - state.lastPipeDetectTime < PIPE_TARGET_GRACE_MS && state.lastKnownPipes.length > 0) {
+                    return state.lastKnownPipes;
                 }
-                if (pipeYs.length > 0) colData.push({ x, pipeYs });
+                return [];
             }
 
-            // Group nearby x-columns into pipe candidates (within 12px)
-            let pipeCandidates = [];
-            for (const col of colData) {
-                const last = pipeCandidates[pipeCandidates.length - 1];
-                if (last && col.x - last.xEnd < 12) {
-                    last.xEnd = col.x;
-                    last.cols.push(col);
-                } else {
-                    pipeCandidates.push({ xStart: col.x, xEnd: col.x, cols: [col] });
-                }
-            }
-
-            // For each candidate, find the gap (largest continuous region
-            // with NO pipe-colored pixels)
+            // Step 2: for each pipe x, find the gap
             let pipes = [];
-            for (const cand of pipeCandidates) {
-                if (cand.cols.length < 3) continue;
-
-                let allPipeY = new Set();
-                for (const col of cand.cols) {
-                    for (const y of col.pipeYs) allPipeY.add(y);
+            const birdX = state.bird.x || 120;
+            for (const pipeX of pipeXs) {
+                if (pipeX < birdX - 20) continue; // behind the bird
+                const gap = findPipeGap(imageData, w, pipeX, GROUND_Y);
+                if (gap) {
+                    pipes.push({
+                        x: pipeX,
+                        gapTop: gap.gapTop,
+                        gapBottom: gap.gapBottom,
+                        gapCenter: gap.gapCenter,
+                        gapSize: gap.gapBottom - gap.gapTop
+                    });
                 }
-                let sorted = [...allPipeY].sort((a, b) => a - b);
-                if (sorted.length < 8) continue;
-
-                // Find gaps: continuous regions with no pipe pixels
-                let gaps = [];
-                let prevY = sorted[0];
-                for (let i = 1; i < sorted.length; i++) {
-                    if (sorted[i] - prevY > 20) {
-                        if (sorted[i] - prevY >= 40) {
-                            gaps.push({ top: prevY, bottom: sorted[i], size: sorted[i] - prevY });
-                        }
-                    }
-                    prevY = sorted[i];
-                }
-                // Also check gap after last pipe pixel to ground
-                if (groundY - sorted[sorted.length - 1] > 40) {
-                    gaps.push({ top: sorted[sorted.length - 1], bottom: groundY, size: groundY - sorted[sorted.length - 1] });
-                }
-                // And gap before first pipe pixel from top
-                if (sorted[0] - 30 > 40) {
-                    gaps.push({ top: 30, bottom: sorted[0], size: sorted[0] - 30 });
-                }
-
-                if (gaps.length === 0) continue;
-                gaps.sort((a, b) => b.size - a.size);
-                const bestGap = gaps[0];
-
-                pipes.push({
-                    x: (cand.xStart + cand.xEnd) / 2,
-                    gapCenter: (bestGap.top + bestGap.bottom) / 2,
-                    gapTop: bestGap.top,
-                    gapBottom: bestGap.bottom,
-                    gapSize: bestGap.size
-                });
             }
 
             pipes.sort((a, b) => a.x - b.x);
-            pipes = pipes.filter(p => p.x > birdX - 20);
 
-            if (state.debugMode) {
-                debugLog(`Pipes: ${pipes.length} [${pipes.map(p => `x=${p.x.toFixed(0)} gap=${p.gapTop.toFixed(0)}-${p.gapBottom.toFixed(0)} (${p.gapSize.toFixed(0)}px)`).join(', ')}]`);
-            }
-
-            const now = Date.now();
             if (pipes.length > 0) {
                 state.lastKnownPipes = pipes;
-                state.lastPipeDetectTime = now;
-            } else if (now - state.lastPipeDetectTime < PIPE_TARGET_GRACE_MS && state.lastKnownPipes.length > 0) {
-                debugLog(`Using ${state.lastKnownPipes.length} cached pipes (grace)`);
-                return state.lastKnownPipes;
+                state.lastPipeDetectTime = Date.now();
             }
 
-            return pipes.slice(0, LOOKAHEAD_PIPES);
+            return pipes;
         } catch (e) {
             debugLog(`Pipe detection error: ${e.message}`);
             return state.lastKnownPipes.length > 0 &&
@@ -691,8 +586,6 @@
         const birdY = state.bird.y;
         const birdVY = state.bird.vy;
 
-        const spd = config.speed + Math.min(0.55, 0.028 * state.currentScore);
-
         // SAFETY: if bird is in the top 25% AND rising, never flap.
         const tooHigh = birdY < (GROUND_Y * 0.25) && birdVY < 0;
         // SAFETY: ground emergency
@@ -709,7 +602,7 @@
             // Ground emergency - always flap, bypass cooldown
             shouldFlap = true;
         } else if (!tooHigh) {
-            shouldFlap = botShouldFlap(birdY, birdVY, pipesAhead, config, spd);
+            shouldFlap = botShouldFlap(birdY, birdVY, pipesAhead, config);
         }
 
         const MIN_FLAP_INTERVAL = 150;
@@ -729,24 +622,25 @@
         if (CONFIG.debugMode && canvas && ctx) {
             const pipes = state.lastKnownPipes || [];
             for (const p of pipes) {
+                const leftX = p.x - PIPE_WIDTH / 2;
                 // Draw gap center line
                 ctx.strokeStyle = '#00ff88';
                 ctx.lineWidth = 2;
                 ctx.beginPath();
-                ctx.moveTo(p.x, p.gapTop);
-                ctx.lineTo(p.x + PIPE_WIDTH, p.gapTop);
-                ctx.moveTo(p.x, p.gapBottom);
-                ctx.lineTo(p.x + PIPE_WIDTH, p.gapBottom);
+                ctx.moveTo(leftX, p.gapTop);
+                ctx.lineTo(leftX + PIPE_WIDTH, p.gapTop);
+                ctx.moveTo(leftX, p.gapBottom);
+                ctx.lineTo(leftX + PIPE_WIDTH, p.gapBottom);
                 ctx.stroke();
                 // Draw gap center dot
                 ctx.fillStyle = '#00ff88';
                 ctx.beginPath();
-                ctx.arc(p.x + PIPE_WIDTH / 2, p.gapCenter, 4, 0, Math.PI * 2);
+                ctx.arc(p.x, p.gapCenter, 4, 0, Math.PI * 2);
                 ctx.fill();
                 // Label
                 ctx.fillStyle = '#00ff88';
                 ctx.font = '11px monospace';
-                ctx.fillText(`gap:${p.gapSize.toFixed(0)}px`, p.x + PIPE_WIDTH + 4, p.gapCenter);
+                ctx.fillText(`gap:${p.gapSize.toFixed(0)}px`, leftX + PIPE_WIDTH + 4, p.gapCenter);
             }
             // Draw bird target
             ctx.fillStyle = 'rgba(0,255,136,0.3)';
@@ -1070,7 +964,7 @@
 
     // ==================== INIT ====================
     function init() {
-        log('FlapMaster v6.5 initializing...');
+        log('FlapMaster v7.0 initializing...');
         canvas = findCanvas();
         if (canvas) {
             ctx = canvas.getContext('2d', { willReadFrequently: true });
