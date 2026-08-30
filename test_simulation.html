@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Flapper Bot - Simulation</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+        * { box-sizing: border-box; font-family: 'Inter', sans-serif; }
+        body { background: #0a0e12; color: #e6edf3; margin: 0; padding: 0; overflow: hidden; }
+        #sim-panel {
+            position: fixed; top: 20px; right: 20px; width: 280px; max-height: 92vh;
+            overflow-y: auto; background: rgba(10, 14, 18, 0.95);
+            backdrop-filter: blur(20px); color: #e6edf3; border-radius: 16px;
+            padding: 14px; box-shadow: 0 0 30px rgba(0, 255, 170, 0.08);
+            z-index: 9999; border: 1px solid rgba(0, 255, 170, 0.12);
+        }
+        #sim-panel label { display: block; margin: 8px 0 3px; color: #8b949e; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; }
+        #sim-panel select, #sim-panel input[type="number"] {
+            width: 100%; padding: 5px 8px; background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(0,255,170,0.15); border-radius: 8px;
+            color: #e6edf3; font-size: 12px; outline: none;
+        }
+        #sim-panel select:focus, #sim-panel input:focus { border-color: #00ffaa; }
+        .header { font-weight: 900; font-size: 16px; background: linear-gradient(135deg, #00ffaa, #00cc88); -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 10px; }
+        .badge { background: rgba(0,255,170,0.12); -webkit-text-fill-color: #8b949e; font-size: 9px; padding: 2px 8px; border-radius: 20px; border: 1px solid rgba(0,255,170,0.15); font-weight: 700; }
+        .stats-box { background: rgba(0,255,170,0.04); border-radius: 8px; padding: 6px 8px; border: 1px solid rgba(0,255,170,0.08); margin-bottom: 10px; }
+        .stat-row { display: flex; justify-content: space-between; font-size: 10px; padding: 2px 0; color: #8b949e; }
+        .stat-val { color: #00ffaa; font-weight: 700; }
+        .btn-group { display: flex; gap: 5px; margin: 10px 0; }
+        .btn { flex: 1; padding: 8px 0; border: none; border-radius: 8px; font-weight: 700; font-size: 11px; cursor: pointer; transition: all 0.15s; }
+        .btn:hover { transform: scale(1.03); filter: brightness(1.2); }
+        .btn-start { background: linear-gradient(135deg, #00cc88, #00ffaa); color: #0a0e12; }
+        .btn-stop { background: linear-gradient(135deg, #cc2233, #ff4455); color: #fff; }
+        .btn-restart { background: linear-gradient(135deg, #d29922, #ffcc44); color: #0a0e12; }
+        .checkbox-row { display: flex; align-items: center; gap: 8px; margin: 5px 0; padding: 3px 5px; background: rgba(255,255,255,0.02); border-radius: 6px; }
+        .checkbox-row input { accent-color: #00ffaa; width: 14px; height: 14px; cursor: pointer; }
+        .checkbox-row label { margin: 0; font-weight: 500; text-transform: none; letter-spacing: 0; font-size: 11px; color: #b1bac4; cursor: pointer; }
+        .log-box { background: rgba(0,0,0,0.4); border-radius: 8px; padding: 6px 8px; height: 120px; overflow-y: auto; font-family: 'JetBrains Mono', monospace; font-size: 10px; line-height: 1.5; border: 1px solid rgba(0,255,170,0.06); margin-top: 4px; color: #8b949e; }
+        .log-box::-webkit-scrollbar { width: 3px; }
+        .log-box::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+        canvas { display: block; background: #121215; border-radius: 16px; border: 1px solid rgba(255,255,255,0.08); }
+    </style>
+</head>
+<body>
+    <canvas id="game" width="940" height="580" style="position:fixed; top:50%; left:50%; transform:translate(-50%,-50%);"></canvas>
+
+    <div id="sim-panel">
+        <div class="header">FLAPMASTER <span class="badge">SIM v1.0</span></div>
+
+        <div class="stats-box">
+            <div class="stat-row"><span>Score</span><span class="stat-val" id="score">0</span></div>
+            <div class="stat-row"><span>Bird Y</span><span class="stat-val" id="birdY">-</span></div>
+            <div class="stat-row"><span>Bird VY</span><span class="stat-val" id="birdVY">-</span></div>
+            <div class="stat-row"><span>Target Gap</span><span class="stat-val" id="targetGap">-</span></div>
+            <div class="stat-row"><span>State</span><span class="stat-val" id="state">idle</span></div>
+        </div>
+
+        <label>Difficulty</label>
+        <select id="difficulty">
+            <option value="chill" selected>Chill (Easy)</option>
+            <option value="pump">Pump (Standard)</option>
+            <option value="degen">Degen (Hard)</option>
+        </select>
+
+        <label>Target Pipes</label>
+        <div style="display:flex; align-items:center; gap:8px; margin-top:3px;">
+            <input type="number" id="targetNum" value="3" min="3" max="50" style="width:50px; text-align:center;">
+            <input type="range" id="targetRange" min="3" max="50" value="3" style="flex:1; accent-color:#00ffaa;">
+            <span id="targetVal" style="color:#00ffaa; font-weight:700; min-width:20px;">3</span>
+        </div>
+
+        <label>Bot Preset</label>
+        <select id="profile">
+            <option value="perfect">Perfect Bot</option>
+            <option value="human">Human Pro</option>
+            <option value="casual" selected>Casual Player</option>
+            <option value="drunk">Drunk Mode</option>
+        </select>
+
+        <div class="checkbox-row"><input type="checkbox" id="showDebug"><label>Show debug info</label></div>
+
+        <div class="btn-group">
+            <button class="btn btn-start" id="btnStart">START</button>
+            <button class="btn btn-stop" id="btnStop">STOP</button>
+            <button class="btn btn-restart" id="btnRestart">Restart</button>
+        </div>
+
+        <label>Log</label>
+        <div class="log-box" id="log"></div>
+    </div>
+
+    <script>
+    // ==================== PHYSICS (EXACT from source) ====================
+    const DIFFICULTY = {
+        chill: { gap: 114, speed: 3.31, gravity: 0.28, jumpForce: -6.1, pipeSpacing: 203, maxFallSpeed: 6.6 },
+        pump:  { gap: 110, speed: 3.44, gravity: 0.29, jumpForce: -6.2, pipeSpacing: 201, maxFallSpeed: 6.8 },
+        degen: { gap: 105, speed: 3.59, gravity: 0.3, jumpForce: -6.3, pipeSpacing: 198, maxFallSpeed: 7 }
+    };
+    const CANVAS_W = 940, CANVAS_H = 580, GROUND_Y = 490, BIRD_R = 13, PIPE_W = 68, PIPE_CAP = 28;
+
+    const PROFILES = {
+        perfect: { accuracy: 0.98, miss: 0.01, delay: 5, interval: 50 },
+        human:   { accuracy: 0.85, miss: 0.05, delay: 25, interval: 60 },
+        casual:  { accuracy: 0.65, miss: 0.15, delay: 60, interval: 70 },
+        drunk:   { accuracy: 0.40, miss: 0.35, delay: 150, interval: 90 }
+    };
+
+    function getMultiplier(diff, p) {
+        if (p <= 0) return 1; if (p === 1) return 1.05; if (p === 2) return 1.07; if (p === 3) return 1.1;
+        const base = diff === 'chill' ? 1.15 : diff === 'pump' ? 1.2 : 1.25;
+        const step = diff === 'chill' ? 0.15 : diff === 'pump' ? 0.2 : 0.25;
+        return Number((base + (p - 4) * step).toFixed(2));
+    }
+
+    // ==================== STATE ====================
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    let state = 'idle', bird = { x: 120, y: 250, vy: 0, rot: 0 }, pipes = [], score = 0;
+    let config = DIFFICULTY.chill, botRunning = false, lastFlap = 0, lastTime = 0, showDebug = false;
+
+    // ==================== LOG ====================
+    function log(msg) {
+        const el = document.getElementById('log');
+        el.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+        el.scrollTop = el.scrollHeight;
+    }
+
+    // ==================== START ====================
+    function startGame() {
+        bird = { x: 120, y: 250, vy: 0, rot: 0 };
+        pipes = []; score = 0; state = 'playing'; lastTime = performance.now(); lastFlap = Date.now();
+        for (let i = 0; i < 3; i++) {
+            const x = 520 + i * config.pipeSpacing;
+            const maxH = GROUND_Y - config.gap - 80;
+            const topH = 60 + Math.random() * (maxH - 60);
+            pipes.push({ x, topH, botY: topH + config.gap, passed: false });
+        }
+        document.getElementById('state').textContent = 'playing';
+        document.getElementById('score').textContent = '0';
+        log('Round started');
+        requestAnimationFrame(loop);
+    }
+
+    // ==================== FLAP ====================
+    function flap() {
+        if (state !== 'playing') return;
+        bird.vy = config.jumpForce;
+        bird.rot = -0.42;
+        lastFlap = Date.now();
+    }
+
+    // ==================== CRASH ====================
+    function crash() {
+        state = 'crashed'; botRunning = false;
+        document.getElementById('state').textContent = 'crashed';
+        log(`Crashed at score ${score}`);
+    }
+
+    // ==================== CASHOUT ====================
+    function cashout() {
+        if (state !== 'playing' || score < 3) return;
+        state = 'cashed_out'; botRunning = false;
+        const m = getMultiplier(document.getElementById('difficulty').value, score);
+        document.getElementById('state').textContent = 'cashed_out';
+        log(`Cashed out ${m}x! Won ${(0.005 * m).toFixed(4)} SOL`);
+    }
+
+    // ==================== BOT ====================
+    function botLogic() {
+        const now = Date.now();
+        const prof = PROFILES[document.getElementById('profile').value];
+        const target = parseInt(document.getElementById('targetNum').value);
+
+        if (score >= target) { cashout(); return; }
+        if (now - lastFlap < prof.interval) return;
+
+        const pipe = pipes.find(p => !p.passed && p.x + PIPE_W > bird.x);
+        if (!pipe) return;
+
+        const safeTop = pipe.topH + PIPE_CAP;
+        const safeBot = pipe.botY - PIPE_CAP;
+        const targetY = safeTop + (safeBot - safeTop) * 0.4;
+
+        if (bird.y > GROUND_Y - 80) {
+            flap();
+        } else if (bird.y > targetY && bird.vy >= 0) {
+            flap();
+        }
+    }
+
+    // ==================== LOOP ====================
+    function loop(ts) {
+        if (state !== 'playing') { draw(); return; }
+        const dt = (ts - lastTime) / 1000;
+        lastTime = ts;
+        const g = Math.min(1.8, Math.max(0.4, 60 * dt));
+
+        // Physics
+        bird.vy = Math.min(config.maxFallSpeed, bird.vy + config.gravity * g);
+        bird.y += bird.vy * g;
+        bird.rot = Math.min(1.2, Math.max(-0.45, bird.vy / config.maxFallSpeed * 1.3));
+
+        // Ground/ceiling
+        if (bird.y + BIRD_R >= GROUND_Y) { bird.y = GROUND_Y - BIRD_R; crash(); draw(); return; }
+        if (bird.y - BIRD_R <= 0) { bird.y = BIRD_R; bird.vy = 0; }
+
+        // Pipes
+        const spd = config.speed + Math.min(0.55, 0.028 * score);
+        for (const p of pipes) p.x -= spd * g;
+
+        // Collision
+        for (const p of pipes) {
+            if (bird.x + BIRD_R > p.x && bird.x - BIRD_R < p.x + PIPE_W &&
+                (bird.y - BIRD_R < p.topH || bird.y + BIRD_R > p.botY)) {
+                crash(); draw(); return;
+            }
+        }
+
+        // Score
+        for (const p of pipes) {
+            if (!p.passed && bird.x > p.x + PIPE_W) {
+                p.passed = true; score++;
+                document.getElementById('score').textContent = score;
+                const m = getMultiplier(document.getElementById('difficulty').value, score);
+                log(`Pipe! Score ${score} (${m}x)`);
+            }
+        }
+
+        // New pipes
+        const last = pipes[pipes.length - 1];
+        if (last && last.x < CANVAS_W) {
+            const gap = Math.max(91, Math.round(config.gap - Math.min(6, 0.19 * score)));
+            const spacing = Math.max(186, Math.round(config.pipeSpacing - Math.min(10, 0.29 * score)));
+            const maxH = GROUND_Y - gap - 80;
+            const topH = 60 + Math.random() * (maxH - 60);
+            pipes.push({ x: last.x + spacing, topH, botY: topH + gap, passed: false });
+        }
+        if (pipes.length > 0 && pipes[0].x < -120) pipes.shift();
+
+        // Bot
+        if (botRunning) botLogic();
+
+        // Update UI
+        document.getElementById('birdY').textContent = bird.y.toFixed(1);
+        document.getElementById('birdVY').textContent = bird.vy.toFixed(1);
+        const next = pipes.find(p => !p.passed && p.x + PIPE_W > bird.x);
+        if (next) document.getElementById('targetGap').textContent = `${next.topH}-${next.botY}`;
+
+        draw();
+        requestAnimationFrame(loop);
+    }
+
+    // ==================== DRAW ====================
+    function draw() {
+        // Sky
+        const grad = ctx.createLinearGradient(0, 0, 0, GROUND_Y);
+        grad.addColorStop(0, '#4ec0ca'); grad.addColorStop(1, '#8edde4');
+        ctx.fillStyle = grad; ctx.fillRect(0, 0, CANVAS_W, GROUND_Y);
+
+        // Ground
+        ctx.fillStyle = '#8B7355'; ctx.fillRect(0, GROUND_Y, CANVAS_W, CANVAS_H - GROUND_Y);
+        ctx.fillStyle = '#6B5335'; ctx.fillRect(0, GROUND_Y, CANVAS_W, 8);
+
+        // Pipes
+        for (const p of pipes) {
+            if (p.x > -PIPE_W && p.x < CANVAS_W) {
+                ctx.fillStyle = '#3d8b37';
+                ctx.fillRect(p.x, 0, PIPE_W, p.topH);
+                ctx.fillRect(p.x, p.botY, PIPE_W, GROUND_Y - p.botY);
+                ctx.fillStyle = '#2d6b27';
+                ctx.fillRect(p.x - 5, p.topH - PIPE_CAP, PIPE_W + 10, PIPE_CAP);
+                ctx.fillRect(p.x - 5, p.botY, PIPE_W + 10, PIPE_CAP);
+
+                // Debug: show safe zone
+                if (showDebug) {
+                    ctx.fillStyle = 'rgba(255, 0, 0, 0.15)';
+                    ctx.fillRect(p.x, p.topH, PIPE_W, PIPE_CAP);
+                    ctx.fillRect(p.x, p.botY - PIPE_CAP, PIPE_W, PIPE_CAP);
+                    ctx.fillStyle = 'rgba(0, 255, 0, 0.1)';
+                    ctx.fillRect(p.x, p.topH + PIPE_CAP, PIPE_W, p.botY - p.topH - PIPE_CAP * 2);
+                }
+            }
+        }
+
+        // Bird
+        ctx.save();
+        ctx.translate(bird.x, bird.y);
+        ctx.rotate(bird.rot);
+        ctx.fillStyle = '#4ade80';
+        ctx.beginPath(); ctx.arc(0, 0, BIRD_R, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.beginPath(); ctx.arc(5, -3, 5, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#000';
+        ctx.beginPath(); ctx.arc(7, -3, 2.5, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#f59e0b';
+        ctx.beginPath(); ctx.moveTo(10, 0); ctx.lineTo(18, 2); ctx.lineTo(10, 5); ctx.closePath(); ctx.fill();
+        ctx.restore();
+
+        // Score
+        if (state === 'playing') {
+            ctx.font = '900 54px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+            ctx.fillStyle = 'rgba(0,0,0,0.4)'; ctx.fillText(score, CANVAS_W/2+3, 41);
+            ctx.strokeStyle = '#000'; ctx.lineWidth = 8; ctx.strokeText(score, CANVAS_W/2, 38);
+            ctx.fillStyle = '#fff'; ctx.fillText(score, CANVAS_W/2, 38);
+        }
+
+        // Overlays
+        if (state === 'crashed' || state === 'cashed_out') {
+            ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+            ctx.fillStyle = '#fff'; ctx.font = '900 48px sans-serif'; ctx.textAlign = 'center';
+            ctx.fillText(state === 'crashed' ? 'CRASHED!' : 'CASHED OUT!', CANVAS_W/2, CANVAS_H/2 - 30);
+            ctx.font = '600 24px sans-serif';
+            const m = getMultiplier(document.getElementById('difficulty').value, score);
+            ctx.fillText(`Score: ${score} | ${m}x`, CANVAS_W/2, CANVAS_H/2 + 20);
+        }
+        if (state === 'idle') {
+            ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+            ctx.fillStyle = '#4ade80'; ctx.font = '900 36px sans-serif'; ctx.textAlign = 'center';
+            ctx.fillText('READY TO TEST', CANVAS_W/2, CANVAS_H/2 - 20);
+            ctx.font = '400 16px sans-serif'; ctx.fillStyle = '#9ca3af';
+            ctx.fillText('Press START or click canvas + SPACE', CANVAS_W/2, CANVAS_H/2 + 20);
+        }
+    }
+
+    // ==================== CONTROLS ====================
+    document.getElementById('btnStart').onclick = () => { if (state !== 'playing') startGame(); botRunning = true; log('Bot ON'); };
+    document.getElementById('btnStop').onclick = () => { botRunning = false; log('Bot OFF'); };
+    document.getElementById('btnRestart').onclick = () => { state = 'idle'; botRunning = false; document.getElementById('state').textContent = 'idle'; draw(); };
+    document.getElementById('showDebug').onchange = (e) => { showDebug = e.target.checked; };
+    document.getElementById('difficulty').onchange = (e) => { config = DIFFICULTY[e.target.value]; log(`Difficulty: ${e.target.value}`); };
+
+    // Target sync
+    const tNum = document.getElementById('targetNum'), tRange = document.getElementById('targetRange'), tVal = document.getElementById('targetVal');
+    tNum.oninput = () => { tRange.value = tNum.value; tVal.textContent = tNum.value; };
+    tRange.oninput = () => { tNum.value = tRange.value; tVal.textContent = tRange.value; };
+
+    // Keyboard
+    document.addEventListener('keydown', (e) => {
+        if (e.code === 'Space' || e.code === 'KeyW') { e.preventDefault(); if (state === 'idle') startGame(); flap(); }
+        if (e.code === 'KeyC' || e.code === 'Enter') cashout();
+        if (e.code === 'KeyR') { state = 'idle'; botRunning = false; document.getElementById('state').textContent = 'idle'; draw(); }
+        if (e.code === 'KeyD') { showDebug = !showDebug; document.getElementById('showDebug').checked = showDebug; }
+    });
+
+    // ==================== HEADLESS AUTO-TEST ====================
+    window.runAutoTest = function(numGames = 100, difficulty = 'chill', profileName = 'perfect') {
+        const diff = DIFFICULTY[difficulty];
+        const prof = PROFILES[profileName];
+        const results = { wins: 0, crashes: 0, scores: [], crashDetails: [] };
+
+        for (let g = 0; g < numGames; g++) {
+            let bY = 250, bVY = 0, pScore = 0, flaps = 0;
+            let pp = [];
+            for (let i = 0; i < 3; i++) {
+                const x = 520 + i * diff.pipeSpacing;
+                const maxH = GROUND_Y - diff.gap - 80;
+                const topH = 60 + Math.random() * (maxH - 60);
+                pp.push({ x, topH, botY: topH + diff.gap, passed: false });
+            }
+            let lastFlapT = -9999, crashed = false;
+
+            if (g === 0) {
+                console.log(`%c[TRACE] gap=${diff.gap} safeZone=PIPE_CAP=${PIPE_CAP}`, 'color:yellow');
+                console.log(`[TRACE] pipe0: topH=${pp[0].topH.toFixed(1)} botY=${pp[0].botY.toFixed(1)} safe=[${(pp[0].topH+PIPE_CAP).toFixed(1)}-${(pp[0].botY-PIPE_CAP).toFixed(1)}]`);
+                console.log(`[TRACE] bird starts at x=13, y=250`);
+            }
+
+            for (let frame = 0; frame < 3000; frame++) {
+                // Bot - target-based approach
+                if (frame * (1000/60) - lastFlapT < prof.interval) {
+                    // skip bot, but still do physics
+                } else {
+                    const pipe = pp.find(p => !p.passed && p.x + PIPE_W > 13);
+                    if (pipe) {
+                        const safeTop = pipe.topH + PIPE_CAP;
+                        const safeBot = pipe.botY - PIPE_CAP;
+                        const targetY = safeTop + (safeBot - safeTop) * 0.4;
+
+                        let shouldFlap = false;
+                        if (bY > GROUND_Y - 80) { shouldFlap = true; }
+                        else if (bY > targetY && bVY >= 0) { shouldFlap = true; }
+
+                        if (shouldFlap && Math.random() >= prof.miss) {
+                            bVY = diff.jumpForce;
+                            lastFlapT = frame * (1000/60);
+                            flaps++;
+                            if (g === 0 && frame < 300) console.log(`  [f${frame}] FLAP y=${bY.toFixed(1)} vy=${bVY.toFixed(1)} target=${targetY.toFixed(1)}`);
+                        }
+                    }
+                }
+
+                // Physics
+                bVY = Math.min(diff.maxFallSpeed, bVY + diff.gravity);
+                bY += bVY;
+                if (bY + BIRD_R >= GROUND_Y) { crashed = true; if (g===0) console.log(`%c  [f${frame}] CRASH GROUND y=${bY.toFixed(1)}`, 'color:red'); break; }
+                if (bY - BIRD_R <= 0) { bY = BIRD_R; bVY = 0; }
+
+                // Pipes
+                const spd = diff.speed + Math.min(0.55, 0.028 * pScore);
+                for (const p of pp) p.x -= spd;
+
+                // Collision
+                for (const p of pp) {
+                    if (13 + BIRD_R > p.x && 13 - BIRD_R < p.x + PIPE_W &&
+                        (bY - BIRD_R < p.topH || bY + BIRD_R > p.botY)) {
+                        crashed = true;
+                        if (g === 0) console.log(`%c  [f${frame}] CRASH PIPE y=${bY.toFixed(1)} birdTop=${(bY-BIRD_R).toFixed(1)} birdBot=${(bY+BIRD_R).toFixed(1)} pipe=[${p.topH.toFixed(1)}-${p.botY.toFixed(1)}] pipeX=${p.x.toFixed(1)}`, 'color:red');
+                        break;
+                    }
+                }
+                if (crashed) break;
+
+                // Score
+                for (const p of pp) {
+                    if (!p.passed && 13 > p.x + PIPE_W) { p.passed = true; pScore++; }
+                }
+
+                // New pipes
+                const last = pp[pp.length - 1];
+                if (last && last.x < CANVAS_W) {
+                    const gap = Math.max(91, Math.round(diff.gap - Math.min(6, 0.19 * pScore)));
+                    const spacing = Math.max(186, Math.round(diff.pipeSpacing - Math.min(10, 0.29 * pScore)));
+                    const maxH = GROUND_Y - gap - 80;
+                    const topH = 60 + Math.random() * (maxH - 60);
+                    pp.push({ x: last.x + spacing, topH, botY: topH + gap, passed: false });
+                }
+                if (pp.length > 0 && pp[0].x < -120) pp.shift();
+
+                // Bot - target-based approach
+                if (frame * (1000/60) - lastFlapT < prof.interval) continue;
+                const pipe = pp.find(p => !p.passed && p.x + PIPE_W > 13);
+                if (!pipe) continue;
+                const safeTop = pipe.topH + PIPE_CAP;
+                const safeBot = pipe.botY - PIPE_CAP;
+
+                // Target: center of safe zone, biased slightly high (bird spends more time falling)
+                const targetY = safeTop + (safeBot - safeTop) * 0.4;
+
+                let shouldFlap = false;
+                if (bY > GROUND_Y - 80) {
+                    shouldFlap = true;
+                } else if (bY > targetY && bVY >= 0) {
+                    // Below target AND not rising → flap to gain altitude
+                    shouldFlap = true;
+                }
+
+                if (shouldFlap && Math.random() >= prof.miss) {
+                    bVY = diff.jumpForce;
+                    lastFlapT = frame * (1000/60);
+                    flaps++;
+                }
+            }
+            if (crashed) {
+                results.crashes++;
+                results.crashDetails.push({ score: pScore, birdY: bY, birdVY: bVY, flaps });
+            }
+            results.scores.push(pScore);
+            if (pScore >= 3) results.wins++;
+        }
+
+        const avg = results.scores.reduce((a,b) => a+b, 0) / results.scores.length;
+        const max = Math.max(...results.scores);
+        const min = Math.min(...results.scores);
+        const median = [...results.scores].sort((a,b) => a-b)[Math.floor(results.scores.length/2)];
+
+        // Crash analysis: how many crashed at score 0, 1, 2
+        const crashBuckets = { 0: 0, 1: 0, 2: 0, '3+': 0 };
+        for (const c of results.crashDetails) {
+            if (c.score <= 2) crashBuckets[c.score]++;
+            else crashBuckets['3+']++;
+        }
+
+        const summary = {
+            games: numGames, difficulty, profile: profileName,
+            wins: results.wins, winRate: ((results.wins/numGames)*100).toFixed(1) + '%',
+            avg: avg.toFixed(1), median, max, min,
+            crashes: results.crashes, crashBuckets
+        };
+
+        console.log('%c=== FLAPPER AUTO-TEST RESULTS ===', 'color: #00ffaa; font-weight: bold; font-size: 14px;');
+        console.table(summary);
+        console.log('%cCrash distribution:', 'color: #ff6b6b;', crashBuckets);
+        console.log('Crash details (first 10):', results.crashDetails.slice(0, 10));
+        return summary;
+    };
+
+    canvas.focus();
+    draw();
+    log('Ready. Press START or SPACE.');
+    log('Auto-test: runAutoTest(100, "chill", "perfect") in console');
+    </script>
+</body>
+</html>
