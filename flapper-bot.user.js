@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FlapMaster – Auto-Flap Bot (GreenPump)
 // @namespace    http://tampermonkey.net/
-// @version      5.5
+// @version      6.0
 // @description  Auto-flap bot. Detects bird position via canvas, flaps and cashes out with keyboard simulation.
 // @author       zavko & limerence
 // @match        https://greenpump.xyz/flappy*
@@ -20,19 +20,19 @@
         customAccuracy: 0.65,
         customMissChance: 0.15,
         customDelayVariance: 60,
-        customMinInterval: 70,
         debugMode: false,
     };
 
     // Game physics (EXACT from source: 41qzff47zxjhm.js)
-    // Bot behavior profiles
+    // Bot behavior profiles. No minInterval/click-limit here on purpose -
+    // the flap decision is physics-based and self-limiting (see gameLoop).
     const PROFILES = {
-        PERFECT_BOT:   { flapAccuracy: 0.98, missChance: 0.01, delayVariance: 5,   minInterval: 50 },
-        HUMAN_PRO:     { flapAccuracy: 0.85, missChance: 0.05, delayVariance: 25,  minInterval: 60 },
-        CASUAL_PLAYER: { flapAccuracy: 0.65, missChance: 0.15, delayVariance: 60,  minInterval: 70 },
-        DRUNK_MODE:    { flapAccuracy: 0.40, missChance: 0.35, delayVariance: 150, minInterval: 90 },
-        CHAOS:         { flapAccuracy: 0.10, missChance: 0.60, delayVariance: 300, minInterval: 120 },
-        CUSTOM:        { flapAccuracy: 0.65, missChance: 0.15, delayVariance: 60,  minInterval: 70 }
+        PERFECT_BOT:   { flapAccuracy: 0.98, missChance: 0.01, delayVariance: 5   },
+        HUMAN_PRO:     { flapAccuracy: 0.85, missChance: 0.05, delayVariance: 25  },
+        CASUAL_PLAYER: { flapAccuracy: 0.65, missChance: 0.15, delayVariance: 60  },
+        DRUNK_MODE:    { flapAccuracy: 0.40, missChance: 0.35, delayVariance: 150 },
+        CHAOS:         { flapAccuracy: 0.10, missChance: 0.60, delayVariance: 300 },
+        CUSTOM:        { flapAccuracy: 0.65, missChance: 0.15, delayVariance: 60  }
     };
 
     // Multiplier calculation (EXACT from source)
@@ -70,6 +70,92 @@
     const PIPE_WIDTH = 68;
     const PIPE_CAP = 28;
 
+    // How many upcoming pipes we try to keep detected/tracked at once.
+    // Only the nearest one is used to aim, but keeping 3 means the bot
+    // doesn't lose the target the instant one canvas scan misses.
+    const LOOKAHEAD_PIPES = 3;
+    // If we briefly lose pipe detection, keep steering at the last known
+    // gap for this long (ms) before giving up and centering.
+    const PIPE_TARGET_GRACE_MS = 800;
+
+    // ==================== BOT CORE ====================
+    // The same planner used in test_simulation.html.
+    //
+    // Old algorithm aimed at "40% from top of safe zone" which was fatally
+    // wrong: one flap rises jumpForce²/(2*gravity) ≈ 66px, the band is
+    // only 88px, and flapping at 40% from top always punches through the
+    // ceiling. The fix: a short-horizon planner that simulates "flap now"
+    // vs "coast now" and picks whichever survives longer.
+    const PLAN_HORIZON = 200;
+    const BAND_MARGIN  = 4;
+
+    function riseHeight(d) {
+        return (d.jumpForce * d.jumpForce) / (2 * d.gravity);
+    }
+
+    // Cheap fallback policy: oscillation centred on the gap centre.
+    function heurFlap(birdY, birdVY, pipesAhead, d) {
+        if (birdY > GROUND_Y - BIRD_RADIUS - 40) return true; // ground emergency
+        let pipe = null;
+        for (const p of pipesAhead) {
+            if (p.x > state.bird.x - 30) { pipe = p; break; }
+        }
+        if (!pipe) return birdVY >= 0 && birdY > GROUND_Y / 2;
+        const bandTop = (pipe.gapTop || pipe.topH) + BIRD_RADIUS + BAND_MARGIN;
+        const bandBot = (pipe.gapBottom || pipe.botY) - BIRD_RADIUS - BAND_MARGIN;
+        const gapCenter = ((pipe.gapTop || pipe.topH) + (pipe.gapBottom || pipe.botY)) / 2;
+        let fp = gapCenter + riseHeight(d) * 0.5;
+        if (fp > bandBot) fp = bandBot;
+        if (fp < bandTop + 2) fp = bandTop + 2;
+        return birdY > fp && birdVY >= 0;
+    }
+
+    // Simulate forward. First frame uses firstAction, then falls back to
+    // heurFlap. Returns {frames survived, pipes passed}.
+    function rolloutFlapAt(y, vy, pipesAhead, d, firstAction, horizon) {
+        let py = y, pvy = vy, passed = 0;
+        const birdX = state.bird.x || 120;
+        const px = pipesAhead.map(p => ({
+            x: p.x,
+            topH: p.gapTop || p.topH,
+            botY: p.gapBottom || p.botY,
+            passed: false
+        }));
+        for (let i = 0; i < horizon; i++) {
+            const act = (i === 0) ? firstAction : heurFlap(py, pvy, px, d);
+            if (act) pvy = d.jumpForce;
+            pvy = Math.min(d.maxFallSpeed, pvy + d.gravity);
+            py += pvy;
+            if (py + BIRD_RADIUS >= GROUND_Y) return { frames: i, passed };
+            if (py - BIRD_RADIUS <= 0) { py = BIRD_RADIUS; pvy = 0; }
+            for (const p of px) p.x -= d.speed;
+            for (const p of px) {
+                if (birdX + BIRD_RADIUS > p.x && birdX - BIRD_RADIUS < p.x + PIPE_WIDTH &&
+                    (py - BIRD_RADIUS < p.topH || py + BIRD_RADIUS > p.botY))
+                    return { frames: i, passed };
+            }
+            for (const p of px) {
+                if (!p.passed && birdX > p.x + PIPE_WIDTH) { p.passed = true; passed++; }
+            }
+        }
+        return { frames: horizon, passed };
+    }
+
+    // The actual decision: try flap-now and coast-now, keep whichever
+    // survives longer. This fixes the phase problem that a fixed threshold
+    // can't solve — 66px rise in an 88px band demands proper planning.
+    function botShouldFlap(birdY, birdVY, pipesAhead, d) {
+        const ahead = pipesAhead.filter(p => p.x > state.bird.x - 30);
+        const f = rolloutFlapAt(birdY, birdVY, ahead, d, true, PLAN_HORIZON);
+        const c = rolloutFlapAt(birdY, birdVY, ahead, d, false, PLAN_HORIZON);
+        if (f.frames === PLAN_HORIZON && c.frames === PLAN_HORIZON) {
+            return heurFlap(birdY, birdVY, ahead, d);
+        }
+        if (f.frames !== c.frames) return f.frames > c.frames;
+        if (f.passed !== c.passed) return f.passed > c.passed;
+        return heurFlap(birdY, birdVY, ahead, d);
+    }
+
     // Physics constants (EXACT from source)
     const DIFFICULTY = {
         chill: { gap: 114, speed: 3.31, gravity: 0.28, jumpForce: -6.1, pipeSpacing: 203, maxFallSpeed: 6.6 },
@@ -82,10 +168,12 @@
         running: false,
         roundActive: false,
         currentScore: 0,
-        birdY: 0,
-        birdX: 0,
-        birdVelocity: 0,
-        lastBirdUpdateTime: 0,
+        // The bird is tracked as a simple physics object: a position (y) and
+        // a velocity (vy), just like the real game simulates it. Canvas
+        // scanning only gives us a noisy *sample* of where the bird is; we
+        // integrate gravity/flap impulses on top of that sample instead of
+        // re-deriving velocity from noisy timestamp math every frame.
+        bird: { x: CANVAS_W * 0.13, y: CANVAS_H / 2, vy: 0, hasSample: false },
         lastFlapTime: 0,
         cashoutPending: false,
         birdHistory: [],
@@ -142,8 +230,7 @@
             return {
                 flapAccuracy: CONFIG.customAccuracy,
                 missChance: CONFIG.customMissChance,
-                delayVariance: CONFIG.customDelayVariance,
-                minInterval: CONFIG.customMinInterval
+                delayVariance: CONFIG.customDelayVariance
             };
         }
         return PROFILES[CONFIG.preset] || PROFILES.CASUAL_PLAYER;
@@ -182,7 +269,7 @@
     }
 
     // ==================== ROUND DETECTION ====================
-    function isRoundActive() {
+    function isRoundActive(hasSample) {
         if (isOverlayVisible()) {
             if (!state.overlayDetected) {
                 state.overlayDetected = true;
@@ -201,8 +288,7 @@
             if (el && getComputedStyle(el).display !== 'none') return false;
         }
 
-        // Read bird position from canvas
-        if (!readBirdPosition()) {
+        if (!hasSample) {
             state.detectionFrames++;
             if (state.detectionFrames > 60) return false;
             return false;
@@ -210,7 +296,7 @@
         state.detectionFrames = 0;
 
         // Track bird movement to detect active round
-        state.birdHistory.push(state.birdY);
+        state.birdHistory.push(state.bird.y);
         if (state.birdHistory.length > 10) state.birdHistory.shift();
 
         if (state.birdHistory.length >= 5) {
@@ -230,9 +316,13 @@
     // ==================== BIRD POSITION (Canvas) ====================
     // Bird is bright lime green (~RGB 120, 220, 80), small cluster (~20-50px)
     // Bushes/trees are darker green (~RGB 80, 140, 60), large clusters
-    // Use size + color to distinguish bird from background
-    function readBirdPosition() {
-        if (!canvas || !ctx) return false;
+    // Use size + color to distinguish bird from background.
+    // This is a PURE detector: it just returns what it sees (or null), and
+    // never touches `state` itself. Physics integration happens separately
+    // in updateBirdPhysics() so the bird's y/vy stay a clean, predictable
+    // object regardless of whether a given canvas scan succeeds.
+    function readBirdSample() {
+        if (!canvas || !ctx) return null;
 
         try {
             const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
@@ -240,7 +330,7 @@
             const w = canvas.width;
             const h = canvas.height;
 
-            // Pass 1: Find all bright green pixel clusters
+            // Find all bright green pixel clusters.
             // Bird = bright lime: G>180, R<120, B<90, G-R>60
             // Exclude bottom 80px (ground) and very top (sky)
             let clusters = [];
@@ -282,29 +372,54 @@
                 }
             }
 
-            if (clusters.length === 0) return false;
+            if (clusters.length === 0) return null;
 
-            // Pick the cluster closest to canvas center Y (bird starts ~center)
-            const centerY = h / 2;
-            clusters.sort((a, b) => Math.abs(a.y - centerY) - Math.abs(b.y - centerY));
+            // Pick the cluster closest to the bird's last known Y (falls back
+            // to canvas center on the very first sample). This is far more
+            // stable than "closest to center" once the bird has moved away
+            // from the middle of the screen.
+            const anchorY = state.bird.hasSample ? state.bird.y : h / 2;
+            clusters.sort((a, b) => Math.abs(a.y - anchorY) - Math.abs(b.y - anchorY));
             const best = clusters[0];
 
-            // Track velocity (change in Y over time)
-            const prevY = state.birdY;
-            const prevTime = state.lastBirdUpdateTime || now;
-            const dt = (now - prevTime) / 1000;
-            if (dt > 0 && dt < 0.5) {
-                state.birdVelocity = (best.y - prevY) / dt;
-            }
-            state.lastBirdUpdateTime = now;
-
-            state.birdY = best.y;
-            state.birdX = best.x;
-            debugLog(`Bird: (${best.x.toFixed(0)}, ${best.y.toFixed(0)}) vel=${state.birdVelocity.toFixed(1)} [${best.size}px, ${clusters.length} clusters]`);
-            return true;
+            return { x: best.x, y: best.y, size: best.size, clusterCount: clusters.length };
         } catch (e) {
             debugLog(`Canvas error: ${e.message}`);
-            return false;
+            return null;
+        }
+    }
+
+    // ==================== BIRD PHYSICS ====================
+    // Treats the bird as a real object on the y-axis: a position + velocity
+    // that gets integrated by gravity every frame, and corrected (not
+    // replaced) by whatever the canvas scan sees. On a flap we set the
+    // velocity to the known jump force immediately, instead of waiting for a
+    // noisy pixel sample to "catch up" - this is what stops the bot from
+    // repeatedly re-flapping while it's already rising (the bug that made
+    // the bird just rocket to the ceiling and stay there).
+    function updateBirdPhysics(sample, difficultyConfig) {
+        const bird = state.bird;
+
+        if (sample) {
+            if (bird.hasSample) {
+                // Raw per-frame velocity estimate from the movement of the
+                // sample. Smoothed (EMA) so one noisy read can't cause a
+                // spike that flips the flap decision for a whole frame.
+                const rawVy = sample.y - bird.y;
+                bird.vy = bird.vy * 0.5 + rawVy * 0.5;
+            }
+            // Blend toward the fresh reading rather than snapping straight to
+            // it - keeps the tracked position smooth even if a single scan
+            // is a few pixels off.
+            bird.y = bird.hasSample ? (bird.y * 0.5 + sample.y * 0.5) : sample.y;
+            bird.x = sample.x;
+            bird.hasSample = true;
+            debugLog(`Bird sample: (${sample.x.toFixed(0)}, ${sample.y.toFixed(0)}) -> y=${bird.y.toFixed(1)} vy=${bird.vy.toFixed(1)} [${sample.size}px, ${sample.clusterCount} clusters]`);
+        } else if (bird.hasSample) {
+            // No sample this frame - keep the bird "alive" as a real falling
+            // object instead of freezing in place or guessing randomly.
+            bird.vy = Math.min(bird.vy + difficultyConfig.gravity, difficultyConfig.maxFallSpeed);
+            bird.y += bird.vy;
         }
     }
 
@@ -321,9 +436,12 @@
             const h = canvas.height;
             const groundY = GROUND_Y; // 490
 
-            // Scan x positions in right half (where pipes are)
+            // Scan from just ahead of the bird all the way to the right edge
+            // so we have a real shot at seeing multiple upcoming pipes
+            // (not just whichever one happens to be closest).
+            const scanStart = Math.max((state.bird.x || 120) + 40, 40);
             let pipes = [];
-            for (let x = w * 0.3; x < w - 20; x += 5) {
+            for (let x = scanStart; x < w - 5; x += 5) {
                 // Count dark vertical pixels in this column
                 let darkCount = 0;
                 let darkYs = [];
@@ -374,14 +492,14 @@
             }
 
             // Sort by x position (closest to bird first)
-            const birdX = state.birdX || 120;
+            const birdX = state.bird.x || 120;
             pipes.sort((a, b) => a.x - b.x);
 
             // Only return pipes ahead of the bird
             pipes = pipes.filter(p => p.x > birdX - 20);
 
             debugLog(`Pipes: ${pipes.length} [${pipes.map(p => `x=${p.x.toFixed(0)} gap=${p.gapCenter.toFixed(0)}`).join(', ')}]`);
-            return pipes.slice(0, 5); // Return at most 5 pipes
+            return pipes.slice(0, LOOKAHEAD_PIPES); // Return the next N pipes ahead
         } catch (e) {
             debugLog(`Pipe detection error: ${e.message}`);
             return [];
@@ -457,7 +575,15 @@
             return;
         }
 
-        const active = isRoundActive();
+        const now = Date.now();
+        const config = DIFFICULTY[CONFIG.difficulty || 'chill'];
+
+        // Update the bird as a physics object every frame: sample the
+        // canvas, then integrate/correct position+velocity from that.
+        const birdSample = readBirdSample();
+        updateBirdPhysics(birdSample, config);
+
+        const active = isRoundActive(!!birdSample);
         if (!active) {
             if (state.roundActive) {
                 state.roundActive = false;
@@ -476,7 +602,8 @@
             state.roundStartLogged = false;
             log(`Round started! Target: ${CONFIG.targetPipes} pipes (${getMultiplier(CONFIG.difficulty || 'chill', CONFIG.targetPipes)}x)`);
             simulateKey(' ');
-            state.lastFlapTime = Date.now();
+            state.bird.vy = config.jumpForce;
+            state.lastFlapTime = now;
         }
 
         // Check target reached
@@ -492,60 +619,27 @@
         }
 
         const profile = getProfile();
-        const { flapAccuracy, missChance, delayVariance, minInterval } = profile;
-        const now = Date.now();
+        const { missChance } = profile;
 
-        // Detect pipes from canvas
-        const pipes = readPipes();
-        const birdY = state.birdY;
-        const birdX = state.birdX || 120;
-        const config = DIFFICULTY[CONFIG.difficulty || 'chill'];
+        // Detect up to LOOKAHEAD_PIPES pipes ahead of the bird.
+        const pipesAhead = readPipes();
 
-        // Find the next pipe (closest ahead of bird)
-        let targetY = GROUND_Y / 2; // default: center of play area
-        if (pipes.length > 0) {
-            // Find the pipe the bird is approaching
-            let nextPipe = null;
-            for (const p of pipes) {
-                if (p.x > birdX - 30) {
-                    nextPipe = p;
-                    break;
-                }
-            }
-            if (nextPipe) {
-                targetY = nextPipe.gapCenter;
-                debugLog(`Target: pipe at x=${nextPipe.x.toFixed(0)}, gap center=${nextPipe.gapCenter.toFixed(0)}`);
-            }
-        }
+        const birdY = state.bird.y;
+        const birdVY = state.bird.vy;
+        debugLog(`birdY=${birdY.toFixed(0)} vy=${birdVY.toFixed(1)} pipes=${pipesAhead.length}`);
 
-        // Calculate flap decision
-        const gapTop = nextPipe.gapTop;
-        const gapBottom = nextPipe.gapBottom;
+        // The planner decides every frame and is naturally self-limiting:
+        // flapping sets vy negative, so "coast" wins the next rollout and
+        // we don't flap again until actually falling.
+        const shouldFlap = botShouldFlap(birdY, birdVY, pipesAhead, config);
 
-        // Account for pipe caps (28px each side) - safe zone is smaller
-        const safeTop = gapTop + PIPE_CAP;
-        const safeBottom = gapBottom - PIPE_CAP;
-
-        // Target: upper 40% of safe zone (bird spends more time falling than rising)
-        const targetY = safeTop + (safeBottom - safeTop) * 0.4;
-
-        debugLog(`birdY=${birdY.toFixed(0)} target=${targetY.toFixed(0)} safe=[${safeTop.toFixed(0)}-${safeBottom.toFixed(0)}] vy=${state.birdVelocity.toFixed(1)}`);
-
-        if (now - state.lastFlapTime > minInterval) {
-            let shouldFlap = false;
-            if (birdY > GROUND_Y - 80) {
-                shouldFlap = true;
-            } else if (birdY > targetY && state.birdVelocity >= 0) {
-                shouldFlap = true;
-            }
-
-            if (shouldFlap) {
-                if (Math.random() < missChance) {
-                    debugLog('Miss chance - skip');
-                } else {
-                    simulateKey(' ');
-                    state.lastFlapTime = now;
-                }
+        if (shouldFlap) {
+            if (Math.random() < missChance) {
+                debugLog('Miss chance - skip flap');
+            } else {
+                simulateKey(' ');
+                state.bird.vy = config.jumpForce;
+                state.lastFlapTime = now;
             }
         }
 
@@ -682,7 +776,7 @@
         panel.id = 'flapper-panel';
         panel.innerHTML = `
             <div class="drag-handle" id="fp-drag-handle">
-                <div class="header">FLAPMASTER <span class="badge">v5.5</span></div>
+                <div class="header">FLAPMASTER <span class="badge">v6.0</span></div>
                 <div style="display:flex;gap:4px;align-items:center;">
                     <button class="minimize-btn" id="fp-minimize" title="Minimize">-</button>
                     <span style="color:#4ade80;font-size:12px;opacity:0.5;">⠿</span>
@@ -721,11 +815,6 @@
                         <label>Delay (ms)</label>
                         <input type="range" id="fp-custom-delay" min="0" max="300" value="60">
                         <span id="fp-custom-delay-val">60</span>
-                    </div>
-                    <div class="custom-slider-row">
-                        <label>Interval (ms)</label>
-                        <input type="range" id="fp-custom-interval" min="50" max="300" value="70">
-                        <span id="fp-custom-interval-val">70</span>
                     </div>
                 </div>
 
@@ -809,16 +898,13 @@
             CONFIG.customAccuracy = parseInt(document.getElementById('fp-custom-accuracy').value) / 100;
             CONFIG.customMissChance = parseInt(document.getElementById('fp-custom-miss').value) / 100;
             CONFIG.customDelayVariance = parseInt(document.getElementById('fp-custom-delay').value);
-            CONFIG.customMinInterval = parseInt(document.getElementById('fp-custom-interval').value);
             document.getElementById('fp-custom-accuracy-val').textContent = document.getElementById('fp-custom-accuracy').value;
             document.getElementById('fp-custom-miss-val').textContent = document.getElementById('fp-custom-miss').value;
             document.getElementById('fp-custom-delay-val').textContent = document.getElementById('fp-custom-delay').value;
-            document.getElementById('fp-custom-interval-val').textContent = document.getElementById('fp-custom-interval').value;
         }
         document.getElementById('fp-custom-accuracy').addEventListener('input', updateCustomConfig);
         document.getElementById('fp-custom-miss').addEventListener('input', updateCustomConfig);
         document.getElementById('fp-custom-delay').addEventListener('input', updateCustomConfig);
-        document.getElementById('fp-custom-interval').addEventListener('input', updateCustomConfig);
 
         // Debug checkbox
         document.getElementById('fp-debug').addEventListener('change', function() {
@@ -874,7 +960,7 @@
 
     // ==================== INIT ====================
     function init() {
-        log('FlapMaster v5.5 initializing...');
+        log('FlapMaster v5.6 initializing...');
         canvas = findCanvas();
         if (canvas) {
             ctx = canvas.getContext('2d', { willReadFrequently: true });

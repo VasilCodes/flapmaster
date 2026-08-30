@@ -44,7 +44,7 @@
     <canvas id="game" width="940" height="580" style="position:fixed; top:50%; left:50%; transform:translate(-50%,-50%);"></canvas>
 
     <div id="sim-panel">
-        <div class="header">FLAPMASTER <span class="badge">SIM v1.0</span></div>
+        <div class="header">FLAPMASTER <span class="badge">SIM v2.0</span></div>
 
         <div class="stats-box">
             <div class="stat-row"><span>Score</span><span class="stat-val" id="score">0</span></div>
@@ -111,6 +111,78 @@
         return Number((base + (p - 4) * step).toFixed(2));
     }
 
+    // ==================== BOT CORE ====================
+    // Shared by the live sim AND runAutoTest so they can never drift apart.
+    //
+    // Two things the old bot got wrong:
+    //  1. It used PIPE_CAP (28) to build its "safe zone". PIPE_CAP is a
+    //     *drawing* detail (the lip on the pipe). Collision actually uses
+    //     BIRD_R (13), so the real usable band is gap-26 (88px on chill),
+    //     not gap-56 (58px). It was throwing away 30px of headroom.
+    //  2. It aimed 40% down from the top of that (already too small) band.
+    //     One flap lifts the bird jumpForce^2/(2*gravity) = ~66px, so
+    //     flapping at the 40% mark ALWAYS punches out through the top of
+    //     the gap. That's why the bird just climbed and hit the top pipe.
+    const BIRD_X = 120;        // bird's fixed x position (matches bird.x)
+    const BAND_MARGIN = 4;     // extra safety padding inside the gap
+    const PLAN_HORIZON = 200;  // frames to simulate ahead when planning
+
+    function riseHeight(d) { return (d.jumpForce * d.jumpForce) / (2 * d.gravity); }
+
+    // Cheap default policy: keep the flap oscillation centred on the gap.
+    // flapPoint = gapCenter + rise/2 means the arc spans roughly
+    // [gapCenter - rise/2, gapCenter + rise/2] -> centred on the gap.
+    function heurFlap(y, vy, pipeList, d) {
+        if (y > GROUND_Y - BIRD_R - 40) return true; // ground emergency
+        let pipe = null;
+        for (const p of pipeList) {
+            if (!p.passed && p.x + PIPE_W > BIRD_X - BIRD_R) { pipe = p; break; }
+        }
+        if (!pipe) return vy >= 0 && y > GROUND_Y / 2; // no pipe: hold mid-screen
+        const bandTop = pipe.topH + BIRD_R + BAND_MARGIN;
+        const bandBot = pipe.botY - BIRD_R - BAND_MARGIN;
+        const gapCenter = (pipe.topH + pipe.botY) / 2;
+        let fp = gapCenter + riseHeight(d) * 0.5;
+        if (fp > bandBot) fp = bandBot;
+        if (fp < bandTop + 2) fp = bandTop + 2;
+        return y > fp && vy >= 0;
+    }
+
+    // Simulate the world forward. First frame uses `firstAction`, after that
+    // we fall back to the cheap policy. Returns how long we survived.
+    function rollout(y, vy, pipeList, d, spd, firstAction, horizon) {
+        let py = y, pvy = vy, passed = 0;
+        const px = pipeList.map(p => ({ x: p.x, topH: p.topH, botY: p.botY, passed: false }));
+        for (let i = 0; i < horizon; i++) {
+            const act = (i === 0) ? firstAction : heurFlap(py, pvy, px, d);
+            if (act) pvy = d.jumpForce;
+            pvy = Math.min(d.maxFallSpeed, pvy + d.gravity);
+            py += pvy;
+            if (py + BIRD_R >= GROUND_Y) return { frames: i, passed };
+            if (py - BIRD_R <= 0) { py = BIRD_R; pvy = 0; }
+            for (const p of px) p.x -= spd;
+            for (const p of px) {
+                if (BIRD_X + BIRD_R > p.x && BIRD_X - BIRD_R < p.x + PIPE_W &&
+                    (py - BIRD_R < p.topH || py + BIRD_R > p.botY)) return { frames: i, passed };
+            }
+            for (const p of px) if (!p.passed && BIRD_X > p.x + PIPE_W) { p.passed = true; passed++; }
+        }
+        return { frames: horizon, passed };
+    }
+
+    // The actual decision: try "flap now" and "coast now", keep whichever
+    // survives longer. This is what fixes the phase problem - a fixed flap
+    // threshold can't stay inside an 88px band when each flap moves 66px.
+    function botShouldFlap(y, vy, pipeList, d, spd) {
+        const ahead = pipeList.filter(p => !p.passed);
+        const f = rollout(y, vy, ahead, d, spd, true, PLAN_HORIZON);
+        const c = rollout(y, vy, ahead, d, spd, false, PLAN_HORIZON);
+        if (f.frames === PLAN_HORIZON && c.frames === PLAN_HORIZON) return heurFlap(y, vy, ahead, d);
+        if (f.frames !== c.frames) return f.frames > c.frames;
+        if (f.passed !== c.passed) return f.passed > c.passed;
+        return heurFlap(y, vy, ahead, d);
+    }
+
     // ==================== STATE ====================
     const canvas = document.getElementById('game');
     const ctx = canvas.getContext('2d');
@@ -166,24 +238,16 @@
 
     // ==================== BOT ====================
     function botLogic() {
-        const now = Date.now();
         const prof = PROFILES[document.getElementById('profile').value];
         const target = parseInt(document.getElementById('targetNum').value);
 
         if (score >= target) { cashout(); return; }
-        if (now - lastFlap < prof.interval) return;
 
-        const pipe = pipes.find(p => !p.passed && p.x + PIPE_W > bird.x);
-        if (!pipe) return;
-
-        const safeTop = pipe.topH + PIPE_CAP;
-        const safeBot = pipe.botY - PIPE_CAP;
-        const targetY = safeTop + (safeBot - safeTop) * 0.4;
-
-        if (bird.y > GROUND_Y - 80) {
-            flap();
-        } else if (bird.y > targetY && bird.vy >= 0) {
-            flap();
+        // No artificial click/interval limit - the planner decides every
+        // frame and is naturally self-limiting (flapping sets vy negative).
+        const spd = config.speed + Math.min(0.55, 0.028 * score);
+        if (botShouldFlap(bird.y, bird.vy, pipes, config, spd)) {
+            if (Math.random() >= prof.miss) flap();
         }
     }
 
@@ -356,35 +420,24 @@
                 const topH = 60 + Math.random() * (maxH - 60);
                 pp.push({ x, topH, botY: topH + diff.gap, passed: false });
             }
-            let lastFlapT = -9999, crashed = false;
+            let crashed = false;
 
             if (g === 0) {
-                console.log(`%c[TRACE] gap=${diff.gap} safeZone=PIPE_CAP=${PIPE_CAP}`, 'color:yellow');
-                console.log(`[TRACE] pipe0: topH=${pp[0].topH.toFixed(1)} botY=${pp[0].botY.toFixed(1)} safe=[${(pp[0].topH+PIPE_CAP).toFixed(1)}-${(pp[0].botY-PIPE_CAP).toFixed(1)}]`);
-                console.log(`[TRACE] bird starts at x=13, y=250`);
+                console.log(`%c[TRACE] gap=${diff.gap} band=gap-2*BIRD_R=${diff.gap - 2*BIRD_R}px  oneFlapRise=${riseHeight(diff).toFixed(1)}px`, 'color:yellow');
+                console.log(`[TRACE] pipe0: topH=${pp[0].topH.toFixed(1)} botY=${pp[0].botY.toFixed(1)} band=[${(pp[0].topH+BIRD_R).toFixed(1)}-${(pp[0].botY-BIRD_R).toFixed(1)}]`);
+                console.log(`[TRACE] bird starts at x=${BIRD_X}, y=250`);
             }
 
             for (let frame = 0; frame < 3000; frame++) {
-                // Bot - target-based approach
-                if (frame * (1000/60) - lastFlapT < prof.interval) {
-                    // skip bot, but still do physics
-                } else {
-                    const pipe = pp.find(p => !p.passed && p.x + PIPE_W > 13);
-                    if (pipe) {
-                        const safeTop = pipe.topH + PIPE_CAP;
-                        const safeBot = pipe.botY - PIPE_CAP;
-                        const targetY = safeTop + (safeBot - safeTop) * 0.4;
-
-                        let shouldFlap = false;
-                        if (bY > GROUND_Y - 80) { shouldFlap = true; }
-                        else if (bY > targetY && bVY >= 0) { shouldFlap = true; }
-
-                        if (shouldFlap && Math.random() >= prof.miss) {
-                            bVY = diff.jumpForce;
-                            lastFlapT = frame * (1000/60);
-                            flaps++;
-                            if (g === 0 && frame < 300) console.log(`  [f${frame}] FLAP y=${bY.toFixed(1)} vy=${bVY.toFixed(1)} target=${targetY.toFixed(1)}`);
-                        }
+                // Bot - ONE decision per frame (the old code ran the bot
+                // twice per frame, which doubled the flap rate and was a
+                // big part of why the bird just climbed to the ceiling).
+                {
+                    const spd0 = diff.speed + Math.min(0.55, 0.028 * pScore);
+                    if (botShouldFlap(bY, bVY, pp, diff, spd0) && Math.random() >= prof.miss) {
+                        bVY = diff.jumpForce;
+                        flaps++;
+                        if (g === 0 && frame < 300) console.log(`  [f${frame}] FLAP y=${bY.toFixed(1)} vy=${bVY.toFixed(1)}`);
                     }
                 }
 
@@ -400,7 +453,7 @@
 
                 // Collision
                 for (const p of pp) {
-                    if (13 + BIRD_R > p.x && 13 - BIRD_R < p.x + PIPE_W &&
+                    if (BIRD_X + BIRD_R > p.x && BIRD_X - BIRD_R < p.x + PIPE_W &&
                         (bY - BIRD_R < p.topH || bY + BIRD_R > p.botY)) {
                         crashed = true;
                         if (g === 0) console.log(`%c  [f${frame}] CRASH PIPE y=${bY.toFixed(1)} birdTop=${(bY-BIRD_R).toFixed(1)} birdBot=${(bY+BIRD_R).toFixed(1)} pipe=[${p.topH.toFixed(1)}-${p.botY.toFixed(1)}] pipeX=${p.x.toFixed(1)}`, 'color:red');
@@ -411,7 +464,7 @@
 
                 // Score
                 for (const p of pp) {
-                    if (!p.passed && 13 > p.x + PIPE_W) { p.passed = true; pScore++; }
+                    if (!p.passed && BIRD_X > p.x + PIPE_W) { p.passed = true; pScore++; }
                 }
 
                 // New pipes
@@ -424,30 +477,6 @@
                     pp.push({ x: last.x + spacing, topH, botY: topH + gap, passed: false });
                 }
                 if (pp.length > 0 && pp[0].x < -120) pp.shift();
-
-                // Bot - target-based approach
-                if (frame * (1000/60) - lastFlapT < prof.interval) continue;
-                const pipe = pp.find(p => !p.passed && p.x + PIPE_W > 13);
-                if (!pipe) continue;
-                const safeTop = pipe.topH + PIPE_CAP;
-                const safeBot = pipe.botY - PIPE_CAP;
-
-                // Target: center of safe zone, biased slightly high (bird spends more time falling)
-                const targetY = safeTop + (safeBot - safeTop) * 0.4;
-
-                let shouldFlap = false;
-                if (bY > GROUND_Y - 80) {
-                    shouldFlap = true;
-                } else if (bY > targetY && bVY >= 0) {
-                    // Below target AND not rising → flap to gain altitude
-                    shouldFlap = true;
-                }
-
-                if (shouldFlap && Math.random() >= prof.miss) {
-                    bVY = diff.jumpForce;
-                    lastFlapT = frame * (1000/60);
-                    flaps++;
-                }
             }
             if (crashed) {
                 results.crashes++;

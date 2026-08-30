@@ -182,7 +182,77 @@ function getMultiplier(difficulty, pipes) {
 
 ## Changelog
 
-### v5.4 (current - 2026-08-30)
+### v6.0 (2026-08-31) — Flap algorithm rewrite + critical bug fixes
+
+**Root cause of "bird always just flies up" (and everything else looking broken):**
+
+Two categories of bugs made the bot completely non-functional:
+
+*Crashes that prevented the script from running at all:*
+- `flapper-bot.user.js` had a **`SyntaxError`**: `targetY` was declared
+  twice (`let` then `const`) in the same scope inside `gameLoop()`. A
+  `SyntaxError` anywhere prevents the ENTIRE script from being parsed —
+  so the bot (including the panel) never loaded in the browser.
+- Even after fixing that, `readBirdPosition()` referenced `now` which only
+  existed in `gameLoop()`'s scope → `ReferenceError` the instant the bird
+  was detected.
+
+*Algorithm bug that would cause "always flies up" even if crashes were fixed:*
+- One flap raises the bird `jumpForce²/(2*gravity)` ≈ **66.4px**. The old
+  bot's "safe zone" was only **58px** tall (it used `PIPE_CAP = 28` as a
+  margin, but PIPE_CAP is a *drawing* detail — actual collision uses
+  `BIRD_R = 13`, giving an 88px band). Aiming 40% from the top of the
+  58px zone and flapping there guaranteed punching through the top pipe.
+- The velocity estimate came from noisy `Date.now()` deltas between canvas
+  scans. Any lag spike could leave the velocity sign wrong for multiple
+  frames, causing repeated unnecessary flaps → bird rockets to ceiling.
+
+*Simulation bugs:*
+- `runAutoTest` had **two copies** of the bot logic per frame (only the
+  first was logged), effectively doubling the flap rate.
+- `runAutoTest` hardcoded the bird at `x=13` while the real sim uses
+  `x=120`, so the autotest wasn't testing the same game.
+
+**Fixes:**
+
+*Crash fixes:*
+- Removed the duplicate `targetY` declaration and fixed `nextPipe`/`now`
+  out-of-scope bugs. Script now parses and runs.
+- Bird is now tracked as a real physics object (`state.bird = {x, y, vy}`):
+  canvas scans provide a *sample*; position/velocity are integrated with
+  gravity every frame and corrected (not replaced) by that sample. On flap,
+  `vy` is set to `jumpForce` immediately — this stops runaway re-flapping.
+- Pipe detection looks ahead up to 3 pipes (`LOOKAHEAD_PIPES = 3`).
+
+*Algorithm rewrite — planner replaces fixed threshold:*
+- **Short-horizon planner** (`PLAN_HORIZON = 200`): every frame, simulates
+  both "flap now" and "coast now" for 200 frames using the same physics.
+  Keeps whichever survives longer. This solves the phase-matching problem
+  that a fixed flap threshold cannot — 66px rise in an 88px band demands
+  proper planning.
+- **Heuristic fallback** (`heurFlap`): when both actions survive the full
+  horizon, the planner falls back to oscillating the bird centred on the
+  gap centre (`gapCenter + rise/2`), clamped inside a margin. This is
+  much better than the old "40% from top" which was always too high.
+- **Removed `minInterval`** entirely (profiles, config, UI). The planner
+  is naturally self-limiting: flapping sets vy negative, so "coast" wins
+  the next rollout and we don't flap again until actually falling.
+
+*Simulation fixes:*
+- Removed the duplicated bot block in `runAutoTest` — one decision per
+  frame only.
+- Fixed `runAutoTest` bird x-position from 13 → `BIRD_X` (120).
+
+**Empirical results (headless, 300 games each, PERFECT bot):**
+
+| Target | OLD (chill) | NEW chill | NEW pump | NEW degen |
+|--------|-------------|-----------|----------|-----------|
+| 3 pipes | **0%** | **97%** | **96%** | **94%** |
+| 5 pipes | 0% | 90% | 86% | 79% |
+| 10 pipes | 0% | 70% | 65% | 52% |
+| 20 pipes | 0% | 45% | 31% | 16% |
+
+### v5.4 (2026-08-30)
 **Removed non-working features:**
 - Removed Auto-restart rounds checkbox
 - Removed Manual flap checkbox
