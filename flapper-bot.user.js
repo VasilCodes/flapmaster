@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FlapMaster – Auto-Flap Bot (GreenPump)
 // @namespace    http://tampermonkey.net/
-// @version      6.4
+// @version      6.5
 // @description  Auto-flap bot. Detects bird position via canvas, flaps and cashes out with keyboard simulation.
 // @author       zavko & limerence
 // @match        https://greenpump.xyz/flappy*
@@ -686,36 +686,43 @@
         const profile = getProfile();
         const { missChance } = profile;
 
-        // Detect up to LOOKAHEAD_PIPES pipes ahead of the bird.
         const pipesAhead = readPipes();
 
         const birdY = state.bird.y;
         const birdVY = state.bird.vy;
-        debugLog(`birdY=${birdY.toFixed(0)} vy=${birdVY.toFixed(1)} pipes=${pipesAhead.length}`);
 
         const spd = config.speed + Math.min(0.55, 0.028 * state.currentScore);
-        const shouldFlap = botShouldFlap(birdY, birdVY, pipesAhead, config, spd);
 
-        // SAFETY: if bird is in the top 25% of the screen AND rising,
-        // NEVER flap. This prevents "goes up nonstop" regardless of
-        // what the planner/heuristic decides.
+        // SAFETY: if bird is in the top 25% AND rising, never flap.
         const tooHigh = birdY < (GROUND_Y * 0.25) && birdVY < 0;
+        // SAFETY: ground emergency
+        const tooLow = birdY > (GROUND_Y - BIRD_RADIUS - 40);
 
-        // HARD COOLDOWN: never flap more than once per MIN_FLAP_INTERVAL ms.
-        const MIN_FLAP_INTERVAL = 150; // ms (~9 frames at 60fps)
+        // Log EVERY frame to browser console so user can paste output
+        const pipeInfo = pipesAhead.length > 0
+            ? pipesAhead.map(p => `x=${p.x.toFixed(0)} gap=${p.gapTop.toFixed(0)}-${p.gapBottom.toFixed(0)}`).join('; ')
+            : 'NONE';
+        console.log(`[FM] y=${birdY.toFixed(0)} vy=${birdVY.toFixed(1)} pipes=[${pipeInfo}] score=${state.currentScore} tooHigh=${tooHigh} tooLow=${tooLow}`);
 
-        if (shouldFlap && !tooHigh) {
+        let shouldFlap = false;
+        if (tooLow) {
+            // Ground emergency - always flap, bypass cooldown
+            shouldFlap = true;
+        } else if (!tooHigh) {
+            shouldFlap = botShouldFlap(birdY, birdVY, pipesAhead, config, spd);
+        }
+
+        const MIN_FLAP_INTERVAL = 150;
+
+        if (shouldFlap) {
             if (Math.random() < missChance) {
                 debugLog('Miss chance - skip flap');
             } else if (now - state.lastFlapTime >= MIN_FLAP_INTERVAL) {
                 simulateKey(' ');
                 state.bird.vy = config.jumpForce;
                 state.lastFlapTime = now;
-            } else {
-                debugLog(`Flap blocked by cooldown (${now - state.lastFlapTime}ms < ${MIN_FLAP_INTERVAL}ms)`);
+                console.log(`[FM] FLAP!`);
             }
-        } else if (tooHigh) {
-            debugLog(`Flap blocked: too high (y=${birdY.toFixed(0)} vy=${birdVY.toFixed(1)})`);
         }
 
         // Debug overlay: draw detected pipes on the canvas
@@ -879,7 +886,7 @@
         panel.id = 'flapper-panel';
         panel.innerHTML = `
             <div class="drag-handle" id="fp-drag-handle">
-                <div class="header">FLAPMASTER <span class="badge">v6.4</span></div>
+                <div class="header">FLAPMASTER <span class="badge">v6.5</span></div>
                 <div style="display:flex;gap:4px;align-items:center;">
                     <button class="minimize-btn" id="fp-minimize" title="Minimize">-</button>
                     <span style="color:#4ade80;font-size:12px;opacity:0.5;">⠿</span>
@@ -1063,7 +1070,7 @@
 
     // ==================== INIT ====================
     function init() {
-        log('FlapMaster v6.4 initializing...');
+        log('FlapMaster v6.5 initializing...');
         canvas = findCanvas();
         if (canvas) {
             ctx = canvas.getContext('2d', { willReadFrequently: true });
