@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FlapMaster – Auto-Flap Bot (GreenPump)
 // @namespace    http://tampermonkey.net/
-// @version      7.0
+// @version      7.1
 // @description  Auto-flap bot. Detects bird position via canvas, flaps and cashes out with keyboard simulation.
 // @author       zavko & limerence
 // @match        https://greenpump.xyz/flappy*
@@ -970,7 +970,7 @@
 
     // ==================== INIT ====================
     function init() {
-        log('FlapMaster v7.0 initializing...');
+        log('FlapMaster v7.1 initializing...');
         canvas = findCanvas();
         if (canvas) {
             ctx = canvas.getContext('2d', { willReadFrequently: true });
