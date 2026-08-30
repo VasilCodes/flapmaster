@@ -138,7 +138,10 @@
         for (const p of pipeList) {
             if (!p.passed && p.x + PIPE_W > BIRD_X - BIRD_R) { pipe = p; break; }
         }
-        if (!pipe) return vy >= 0 && y > GROUND_Y / 2; // no pipe: hold mid-screen
+        if (!pipe) {
+            const playHeight = GROUND_Y - 60;
+            return vy >= 0 && y > 60 + playHeight * 0.65;
+        } // no pipe: hold mid-screen
         const bandTop = pipe.topH + BIRD_R + BAND_MARGIN;
         const bandBot = pipe.botY - BIRD_R - BAND_MARGIN;
         const gapCenter = (pipe.topH + pipe.botY) / 2;

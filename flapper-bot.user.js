@@ -95,12 +95,22 @@
 
     // Cheap fallback policy: oscillation centred on the gap centre.
     function heurFlap(birdY, birdVY, pipesAhead, d) {
-        if (birdY > GROUND_Y - BIRD_RADIUS - 40) return true; // ground emergency
+        // Ground emergency — always flap
+        if (birdY > GROUND_Y - BIRD_RADIUS - 40) return true;
+
+        // No pipes detected: be CONSERVATIVE. Only flap when falling
+        // below the lower third of the play area. This avoids the
+        // "spam upwards" problem where the bot flaps every frame
+        // because the bird is above the screen centre.
         let pipe = null;
         for (const p of pipesAhead) {
             if (p.x > state.bird.x - 30) { pipe = p; break; }
         }
-        if (!pipe) return birdVY >= 0 && birdY > GROUND_Y / 2;
+        if (!pipe) {
+            const playHeight = GROUND_Y - 60; // approximate playable height
+            return birdVY >= 0 && birdY > 60 + playHeight * 0.65;
+        }
+
         const bandTop = (pipe.gapTop || pipe.topH) + BIRD_RADIUS + BAND_MARGIN;
         const bandBot = (pipe.gapBottom || pipe.botY) - BIRD_RADIUS - BAND_MARGIN;
         const gapCenter = ((pipe.gapTop || pipe.topH) + (pipe.gapBottom || pipe.botY)) / 2;
@@ -434,8 +444,11 @@
     }
 
     // ==================== PIPE DETECTION (Canvas) ====================
-    // Pipes are dark teal/green columns (RGB ~50-100, 120-180, 80-140)
-    // Scan vertical columns in right half of canvas for dark pixels
+    // Pipes are dark vertical columns with a gap. Scan the right side of
+    // the canvas for columns with many dark pixels, then find gaps between
+    // the dark regions. Uses broad "dark" criteria rather than a specific
+    // color range, since the exact pipe colors depend on the game's
+    // rendering which may change.
     function readPipes() {
         if (!canvas || !ctx) return [];
 
@@ -446,27 +459,31 @@
             const h = canvas.height;
             const groundY = GROUND_Y; // 490
 
-            // Scan from just ahead of the bird all the way to the right edge
-            // so we have a real shot at seeing multiple upcoming pipes
-            // (not just whichever one happens to be closest).
-            const scanStart = Math.max((state.bird.x || 120) + 40, 40);
+            // Scan from the bird's position onward to the right edge.
+            // Start 20px ahead of the bird (not 40) so we catch pipes
+            // we're already overlapping.
+            const scanStart = Math.max((state.bird.x || 120) + 20, 30);
             let pipes = [];
-            for (let x = scanStart; x < w - 5; x += 5) {
-                // Count dark vertical pixels in this column
+            for (let x = scanStart; x < w - 5; x += 4) {
+                // Count dark pixels in this vertical column.
+                // "Dark" = brightness < 100 (regardless of hue). This
+                // catches green pipes, dark backgrounds, and any other
+                // dark vertical structures.
                 let darkCount = 0;
                 let darkYs = [];
-                for (let y = 30; y < groundY; y += 3) {
+                for (let y = 30; y < groundY; y += 2) {
                     const idx = (y * w + x) * 4;
                     const r = data[idx], g = data[idx+1], b = data[idx+2];
-                    // Pipe color: dark teal/green (not sky, not bird, not ground)
-                    if (r < 120 && g > 80 && g < 200 && b > 60 && b < 180 && g > r) {
+                    const brightness = (r + g + b) / 3;
+                    if (brightness < 110 && g > r * 0.7) {
                         darkCount++;
                         darkYs.push(y);
                     }
                 }
 
-                // A pipe column has many dark pixels (at least 30% of playable height)
-                if (darkCount > 20 && darkYs.length > 0) {
+                // A pipe column has a continuous run of dark pixels.
+                // Threshold: at least 15 dark pixels in the column.
+                if (darkCount > 15 && darkYs.length > 0) {
                     // Check if this x is close to an existing pipe (merge)
                     let merged = false;
                     for (const p of pipes) {
@@ -480,7 +497,7 @@
                         darkYs.sort((a, b) => a - b);
                         let gaps = [];
                         for (let i = 1; i < darkYs.length; i++) {
-                            if (darkYs[i] - darkYs[i-1] > 30) {
+                            if (darkYs[i] - darkYs[i-1] > 25) {
                                 gaps.push({
                                     top: darkYs[i-1],
                                     bottom: darkYs[i],
