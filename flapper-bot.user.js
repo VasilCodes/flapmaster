@@ -446,11 +446,16 @@
     }
 
     // ==================== PIPE DETECTION (Canvas) ====================
-    // Pipes are dark vertical columns with a gap. Scan the right side of
-    // the canvas for columns with many dark pixels, then find gaps between
-    // the dark regions. Uses broad "dark" criteria rather than a specific
-    // color range, since the exact pipe colors depend on the game's
-    // rendering which may change.
+    // REAL GAME pipe colors (from 41qzff47zxjhm.js source):
+    //   #a3e048 (163,224,72) — brightest stripe
+    //   #8cd600 (140,214,0)  — second stripe
+    //   #73bf2e (115,191,46) — middle stripe
+    //   #558b2f (85,139,47)  — darker stripe
+    //   #3d661b (61,102,27)  — very dark stripe
+    //   #2e5200 (46,82,0)    — outline/stroke
+    // Sky: #4ec0ca → #8edde4 (cyan, R≈G high, B high)
+    // Pipe = greenish (G >> R) and not cyan (B not too high relative to G).
+    // Key insight: sky has G≈R (both ~200), pipes have G >> R.
     function readPipes() {
         if (!canvas || !ctx) return [];
 
@@ -458,35 +463,32 @@
             const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
             const data = imageData.data;
             const w = canvas.width;
-            const h = canvas.height;
-            const groundY = GROUND_Y; // 490
+            const groundY = GROUND_Y;
 
-            // Scan from just behind the bird to the right edge.
             const birdX = state.bird.x || 120;
             const scanStart = Math.max(birdX - BIRD_RADIUS - 5, 30);
 
-            // For each x column, collect all "pipe-colored" y positions.
-            // A pipe pixel is: relatively dark AND greenish. We use a
-            // generous definition to avoid missing the real game's rendering.
-            let colData = []; // { x, darkYs[] }
+            // For each x, collect y-positions of pipe-colored pixels.
+            let colData = [];
             for (let x = scanStart; x < w - 5; x += 3) {
-                let darkYs = [];
+                let pipeYs = [];
                 for (let y = 30; y < groundY; y += 2) {
                     const idx = (y * w + x) * 4;
                     const r = data[idx], g = data[idx+1], b = data[idx+2];
-                    const brightness = (r + g + b) / 3;
-                    // Pipe = dark AND greenish, OR very dark (near-black)
-                    const isGreenish = g > r * 0.6 && g > 40;
-                    const isDark = brightness < 120;
-                    if (isDark && isGreenish) {
-                        darkYs.push(y);
+
+                    // Bright pipe stripe: green dominates red by 30+
+                    const isGreenish = g > r + 30 && g > 60 && r < 180;
+                    // Dark outline: very dark and greenish
+                    const isDarkGreen = r < 70 && g < 110 && g > r && (g + r + b) / 3 < 70;
+
+                    if (isGreenish || isDarkGreen) {
+                        pipeYs.push(y);
                     }
                 }
-                if (darkYs.length > 0) colData.push({ x, darkYs });
+                if (pipeYs.length > 0) colData.push({ x, pipeYs });
             }
 
-            // Group nearby x-columns into pipe candidates.
-            // Two columns belong to the same pipe if they're within 12px.
+            // Group nearby x-columns into pipe candidates (within 12px)
             let pipeCandidates = [];
             for (const col of colData) {
                 const last = pipeCandidates[pipeCandidates.length - 1];
@@ -498,44 +500,45 @@
                 }
             }
 
-            // For each pipe candidate, find the gap (largest continuous
-            // region with no dark pixels, between y=60 and y=450).
+            // For each candidate, find the gap (largest continuous region
+            // with NO pipe-colored pixels)
             let pipes = [];
             for (const cand of pipeCandidates) {
-                if (cand.cols.length < 3) continue; // too narrow = noise
+                if (cand.cols.length < 3) continue;
 
-                // Merge all darkYs from all columns in this candidate
-                let allDark = new Set();
+                let allPipeY = new Set();
                 for (const col of cand.cols) {
-                    for (const y of col.darkYs) allDark.add(y);
+                    for (const y of col.pipeYs) allPipeY.add(y);
                 }
-                let sorted = [...allDark].sort((a, b) => a - b);
-                if (sorted.length < 10) continue;
+                let sorted = [...allPipeY].sort((a, b) => a - b);
+                if (sorted.length < 8) continue;
 
-                // Find gaps:连续 regions where dark pixels stop
+                // Find gaps: continuous regions with no pipe pixels
                 let gaps = [];
-                let gapStart = sorted[0];
+                let prevY = sorted[0];
                 for (let i = 1; i < sorted.length; i++) {
-                    if (sorted[i] - sorted[i-1] > 20) {
-                        // Gap between sorted[i-1] and sorted[i]
-                        const gapTop = sorted[i-1];
-                        const gapBot = sorted[i];
-                        if (gapBot - gapTop >= 40) { // real gap must be ≥40px
-                            gaps.push({ top: gapTop, bottom: gapBot, size: gapBot - gapTop });
+                    if (sorted[i] - prevY > 20) {
+                        if (sorted[i] - prevY >= 40) {
+                            gaps.push({ top: prevY, bottom: sorted[i], size: sorted[i] - prevY });
                         }
-                        gapStart = sorted[i];
                     }
+                    prevY = sorted[i];
+                }
+                // Also check gap after last pipe pixel to ground
+                if (groundY - sorted[sorted.length - 1] > 40) {
+                    gaps.push({ top: sorted[sorted.length - 1], bottom: groundY, size: groundY - sorted[sorted.length - 1] });
+                }
+                // And gap before first pipe pixel from top
+                if (sorted[0] - 30 > 40) {
+                    gaps.push({ top: 30, bottom: sorted[0], size: sorted[0] - 30 });
                 }
 
-                // The bird's gap is the one that's roughly centered in the
-                // playable area (y 100-450). Pick the largest gap.
                 if (gaps.length === 0) continue;
                 gaps.sort((a, b) => b.size - a.size);
                 const bestGap = gaps[0];
 
-                const midX = (cand.xStart + cand.xEnd) / 2;
                 pipes.push({
-                    x: midX,
+                    x: (cand.xStart + cand.xEnd) / 2,
                     gapCenter: (bestGap.top + bestGap.bottom) / 2,
                     gapTop: bestGap.top,
                     gapBottom: bestGap.bottom,
@@ -543,18 +546,13 @@
                 });
             }
 
-            // Sort by x position (closest to bird first)
             pipes.sort((a, b) => a.x - b.x);
-
-            // Only return pipes ahead of the bird
             pipes = pipes.filter(p => p.x > birdX - 20);
 
             if (state.debugMode) {
                 debugLog(`Pipes: ${pipes.length} [${pipes.map(p => `x=${p.x.toFixed(0)} gap=${p.gapTop.toFixed(0)}-${p.gapBottom.toFixed(0)} (${p.gapSize.toFixed(0)}px)`).join(', ')}]`);
             }
 
-            // Grace: if no pipes detected this frame but we had recent ones,
-            // keep using them briefly so the planner doesn't lose its target.
             const now = Date.now();
             if (pipes.length > 0) {
                 state.lastKnownPipes = pipes;
