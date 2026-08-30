@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FlapMaster – Auto-Flap Bot (GreenPump)
 // @namespace    http://tampermonkey.net/
-// @version      6.1
+// @version      6.2
 // @description  Auto-flap bot. Detects bird position via canvas, flaps and cashes out with keyboard simulation.
 // @author       zavko & limerence
 // @match        https://greenpump.xyz/flappy*
@@ -122,7 +122,7 @@
 
     // Simulate forward. First frame uses firstAction, then falls back to
     // heurFlap. Returns {frames survived, pipes passed}.
-    function rolloutFlapAt(y, vy, pipesAhead, d, firstAction, horizon) {
+    function rolloutFlapAt(y, vy, pipesAhead, d, spd, firstAction, horizon) {
         let py = y, pvy = vy, passed = 0;
         const birdX = state.bird.x || 120;
         const px = pipesAhead.map(p => ({
@@ -138,7 +138,7 @@
             py += pvy;
             if (py + BIRD_RADIUS >= GROUND_Y) return { frames: i, passed };
             if (py - BIRD_RADIUS <= 0) { py = BIRD_RADIUS; pvy = 0; }
-            for (const p of px) p.x -= d.speed;
+            for (const p of px) p.x -= spd;
             for (const p of px) {
                 if (birdX + BIRD_RADIUS > p.x && birdX - BIRD_RADIUS < p.x + PIPE_WIDTH &&
                     (py - BIRD_RADIUS < p.topH || py + BIRD_RADIUS > p.botY))
@@ -154,10 +154,10 @@
     // The actual decision: try flap-now and coast-now, keep whichever
     // survives longer. This fixes the phase problem that a fixed threshold
     // can't solve — 66px rise in an 88px band demands proper planning.
-    function botShouldFlap(birdY, birdVY, pipesAhead, d) {
+    function botShouldFlap(birdY, birdVY, pipesAhead, d, spd) {
         const ahead = pipesAhead.filter(p => p.x > state.bird.x - 30);
-        const f = rolloutFlapAt(birdY, birdVY, ahead, d, true, PLAN_HORIZON);
-        const c = rolloutFlapAt(birdY, birdVY, ahead, d, false, PLAN_HORIZON);
+        const f = rolloutFlapAt(birdY, birdVY, ahead, d, spd, true, PLAN_HORIZON);
+        const c = rolloutFlapAt(birdY, birdVY, ahead, d, spd, false, PLAN_HORIZON);
         if (f.frames === PLAN_HORIZON && c.frames === PLAN_HORIZON) {
             return heurFlap(birdY, birdVY, ahead, d);
         }
@@ -191,6 +191,8 @@
         crashRequested: false,
         overlayDetected: false,
         roundStartLogged: false,
+        lastKnownPipes: [],    // grace: keep last detected pipes briefly
+        lastPipeDetectTime: 0,
     };
 
     let stats = {
@@ -459,10 +461,9 @@
             const h = canvas.height;
             const groundY = GROUND_Y; // 490
 
-            // Scan from the bird's position onward to the right edge.
-            // Start 20px ahead of the bird (not 40) so we catch pipes
-            // we're already overlapping.
-            const scanStart = Math.max((state.bird.x || 120) + 20, 30);
+            // Scan from just behind the bird to the right edge.
+            const birdX = state.bird.x || 120;
+            const scanStart = Math.max(birdX - BIRD_RADIUS - 5, 30);
             let pipes = [];
             for (let x = scanStart; x < w - 5; x += 4) {
                 // Count dark pixels in this vertical column.
@@ -519,17 +520,30 @@
             }
 
             // Sort by x position (closest to bird first)
-            const birdX = state.bird.x || 120;
             pipes.sort((a, b) => a.x - b.x);
 
             // Only return pipes ahead of the bird
             pipes = pipes.filter(p => p.x > birdX - 20);
 
             debugLog(`Pipes: ${pipes.length} [${pipes.map(p => `x=${p.x.toFixed(0)} gap=${p.gapCenter.toFixed(0)}`).join(', ')}]`);
-            return pipes.slice(0, LOOKAHEAD_PIPES); // Return the next N pipes ahead
+
+            // Grace: if no pipes detected this frame but we had recent ones,
+            // keep using them briefly so the planner doesn't lose its target.
+            const now = Date.now();
+            if (pipes.length > 0) {
+                state.lastKnownPipes = pipes;
+                state.lastPipeDetectTime = now;
+            } else if (now - state.lastPipeDetectTime < PIPE_TARGET_GRACE_MS && state.lastKnownPipes.length > 0) {
+                debugLog(`Using ${state.lastKnownPipes.length} cached pipes (grace)`);
+                return state.lastKnownPipes;
+            }
+
+            return pipes.slice(0, LOOKAHEAD_PIPES);
         } catch (e) {
             debugLog(`Pipe detection error: ${e.message}`);
-            return [];
+            return state.lastKnownPipes.length > 0 &&
+                   Date.now() - state.lastPipeDetectTime < PIPE_TARGET_GRACE_MS
+                ? state.lastKnownPipes : [];
         }
     }
 
@@ -658,7 +672,8 @@
         // The planner decides every frame and is naturally self-limiting:
         // flapping sets vy negative, so "coast" wins the next rollout and
         // we don't flap again until actually falling.
-        const shouldFlap = botShouldFlap(birdY, birdVY, pipesAhead, config);
+        const spd = config.speed + Math.min(0.55, 0.028 * state.currentScore);
+        const shouldFlap = botShouldFlap(birdY, birdVY, pipesAhead, config, spd);
 
         if (shouldFlap) {
             if (Math.random() < missChance) {
@@ -803,7 +818,7 @@
         panel.id = 'flapper-panel';
         panel.innerHTML = `
             <div class="drag-handle" id="fp-drag-handle">
-                <div class="header">FLAPMASTER <span class="badge">v6.1</span></div>
+                <div class="header">FLAPMASTER <span class="badge">v6.2</span></div>
                 <div style="display:flex;gap:4px;align-items:center;">
                     <button class="minimize-btn" id="fp-minimize" title="Minimize">-</button>
                     <span style="color:#4ade80;font-size:12px;opacity:0.5;">⠿</span>
@@ -987,7 +1002,7 @@
 
     // ==================== INIT ====================
     function init() {
-        log('FlapMaster v6.1 initializing...');
+        log('FlapMaster v6.2 initializing...');
         canvas = findCanvas();
         if (canvas) {
             ctx = canvas.getContext('2d', { willReadFrequently: true });

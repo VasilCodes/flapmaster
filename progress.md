@@ -252,6 +252,27 @@ Two categories of bugs made the bot completely non-functional:
 | 10 pipes | 0% | 70% | 65% | 52% |
 | 20 pipes | 0% | 45% | 31% | 16% |
 
+### v6.2 (2026-08-31) — Planner speed fix + pipe detection improvements
+
+**Bug fixes:**
+- `rolloutFlapAt` in the live bot used constant `d.speed` for pipe movement
+  in the planner simulation, while the real game uses `speed + min(0.55, 0.028 * score)`.
+  This made the planner underestimate pipe approach speed at higher scores.
+  Fixed by passing `spd` parameter through `botShouldFlap` → `rolloutFlapAt`.
+- `readPipes` scan started at `birdX + 20`, missing pipes the bird was
+  already overlapping. Changed to `birdX - BIRD_RADIUS - 5`.
+- Added pipe grace logic: if no pipes detected this frame but we had
+  recent ones (< 800ms), keep using cached pipes so the planner doesn't
+  lose its target during brief detection drops.
+
+**Empirical results (headless, 300 games, 1% miss):**
+
+| Target | chill | pump | degen |
+|--------|-------|------|-------|
+| 3 pipes | 97% | 96% | 93% |
+| 5 pipes | 89% | 85% | 78% |
+| 10 pipes | 70% | 63% | 48% |
+
 ### v5.4 (2026-08-30)
 **Removed non-working features:**
 - Removed Auto-restart rounds checkbox
