@@ -190,17 +190,17 @@
 
     // Detect the bird by scanning a narrow strip around x=90-150 for
     // non-sky, non-pipe pixels (the bird sprite).
-    function readBirdSample() {
-        if (!canvas || !ctx) return null;
+    // Uses shared imageData from gameLoop to avoid repeated getImageData calls.
+    function readBirdSample(imageData, w) {
+        if (!canvas || !ctx || !imageData) return null;
         try {
             const scanX = 90, scanW = 60;
-            const imageData = ctx.getImageData(scanX, 0, scanW, canvas.height);
             const data = imageData.data;
             let birdPixels = [];
 
             for (let x = 0; x < scanW; x++) {
                 for (let y = 50; y < GROUND_Y; y += 2) {
-                    const idx = (y * scanW + x) * 4;
+                    const idx = (y * w + (scanX + x)) * 4;
                     const r = data[idx], g = data[idx+1], b = data[idx+2];
                     if (!isSky(r, g, b) && !isPipe(r, g, b)) {
                         birdPixels.push({ x: scanX + x, y });
@@ -416,11 +416,10 @@
 
     // ==================== PIPE DETECTION ====================
     // Simple approach: scan top row for pipe columns, then scan down for gaps.
-    function readPipes() {
-        if (!canvas || !ctx) return [];
+    // Uses shared imageData from gameLoop to avoid repeated getImageData calls.
+    function readPipes(imageData, w) {
+        if (!canvas || !ctx || !imageData) return [];
         try {
-            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-            const w = canvas.width;
 
             // Step 1: find pipe x-positions by scanning y=5
             const pipeXs = findPipeXPositions(imageData, w);
@@ -538,9 +537,16 @@
         const now = Date.now();
         const config = DIFFICULTY[CONFIG.difficulty || 'chill'];
 
-        // Update the bird as a physics object every frame: sample the
-        // canvas, then integrate/correct position+velocity from that.
-        const birdSample = readBirdSample();
+        // Read canvas ONCE per frame — both bird and pipe detection share it.
+        let imageData = null;
+        if (canvas && ctx) {
+            try {
+                imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            } catch (e) { /* ignore */ }
+        }
+        const w = canvas ? canvas.width : 940;
+
+        const birdSample = readBirdSample(imageData, w);
         updateBirdPhysics(birdSample, config);
 
         const active = isRoundActive(!!birdSample);
@@ -581,7 +587,7 @@
         const profile = getProfile();
         const { missChance } = profile;
 
-        const pipesAhead = readPipes();
+        const pipesAhead = readPipes(imageData, w);
 
         const birdY = state.bird.y;
         const birdVY = state.bird.vy;
