@@ -314,13 +314,16 @@
     }
 
     // ==================== BIRD POSITION (Canvas) ====================
-    // Bird is bright lime green (~RGB 120, 220, 80), small cluster (~20-50px)
-    // Bushes/trees are darker green (~RGB 80, 140, 60), large clusters
-    // Use size + color to distinguish bird from background.
-    // This is a PURE detector: it just returns what it sees (or null), and
-    // never touches `state` itself. Physics integration happens separately
-    // in updateBirdPhysics() so the bird's y/vy stay a clean, predictable
-    // object regardless of whether a given canvas scan succeeds.
+    // The bird is a pixel-art sprite (loaded from /flappy-bird.png) with
+    // MULTIPLE shades of green (bright lime to dark green), a white eye,
+    // and a black outline. The old detection only matched the very brightest
+    // green (G>180) which was too strict — the cluster never reached the
+    // 15px minimum, so detection always returned null.
+    //
+    // New approach: match ANY green-dominant pixel (G>R and G>100) in the
+    // left half of the canvas. The bird is the only green object there
+    // during gameplay (bushes/trees are far left/bottom and much larger).
+    // Filter by cluster size: bird is ~500-2000px, bushes are 5000+.
     function readBirdSample() {
         if (!canvas || !ctx) return null;
 
@@ -330,37 +333,44 @@
             const w = canvas.width;
             const h = canvas.height;
 
-            // Find all bright green pixel clusters.
-            // Bird = bright lime: G>180, R<120, B<90, G-R>60
-            // Exclude bottom 80px (ground) and very top (sky)
             let clusters = [];
             let visited = new Uint8Array(w * h);
 
-            for (let y = 60; y < h - 80; y += 3) {
-                for (let x = 50; x < w * 0.4; x += 3) {
+            // Scan the left half of the canvas, excluding ground and top sky.
+            // Step by 2px for better cluster connectivity than the old 3px.
+            for (let y = 40; y < h - 80; y += 2) {
+                for (let x = 30; x < w * 0.5; x += 2) {
                     const idx = (y * w + x) * 4;
                     const r = data[idx], g = data[idx+1], b = data[idx+2];
 
-                    // Strict bird color: bright lime green
-                    if (g < 180 || r > 120 || b > 90 || (g - r) < 60) continue;
+                    // Bird-dominant green: any pixel where green channel
+                    // dominates red AND is reasonably bright. This catches
+                    // all shades of the sprite (bright highlights through
+                    // medium body greens) while excluding sky (blue-heavy),
+                    // pipes (darker/different hue), ground (brown), and the
+                    // black outline.
+                    if (g < 100 || g <= r || (g - r) < 20) continue;
                     if (visited[y * w + x]) continue;
 
-                    // Flood-fill cluster
+                    // Flood-fill cluster — allow up to 3000px (bird sprite
+                    // with surrounding green pixels). Bushes/trees are 5000+.
                     let pixels = [];
                     let stack = [[x, y]];
-                    while (stack.length > 0 && pixels.length < 200) {
+                    while (stack.length > 0 && pixels.length < 3000) {
                         const [cx, cy] = stack.pop();
                         if (cx < 0 || cx >= w || cy < 0 || cy >= h) continue;
                         const ci = (cy * w + cx) * 4;
                         if (visited[cy * w + cx]) continue;
-                        if (data[ci+1] < 180 || data[ci] > 120 || data[ci+2] > 90 || (data[ci+1] - data[ci]) < 60) continue;
+                        const cr = data[ci], cg = data[ci+1], cb = data[ci+2];
+                        if (cg < 100 || cg <= cr || (cg - cr) < 20) continue;
                         visited[cy * w + cx] = 1;
                         pixels.push({ x: cx, y: cy });
-                        stack.push([cx+3, cy], [cx-3, cy], [cx, cy+3], [cx, cy-3]);
+                        stack.push([cx+2, cy], [cx-2, cy], [cx, cy+2], [cx, cy-2]);
                     }
 
-                    // Bird cluster: 15-150 pixels (bushes are 500+)
-                    if (pixels.length >= 15 && pixels.length <= 150) {
+                    // Bird cluster: 30-2500 pixels
+                    // (bushes/trees are 5000+, pipes are vertical and far right)
+                    if (pixels.length >= 30 && pixels.length <= 2500) {
                         let sumX = 0, sumY = 0;
                         for (const p of pixels) { sumX += p.x; sumY += p.y; }
                         clusters.push({
@@ -375,13 +385,13 @@
             if (clusters.length === 0) return null;
 
             // Pick the cluster closest to the bird's last known Y (falls back
-            // to canvas center on the very first sample). This is far more
-            // stable than "closest to center" once the bird has moved away
-            // from the middle of the screen.
+            // to canvas center on the very first sample). This is more stable
+            // than "closest to center" once the bird has moved.
             const anchorY = state.bird.hasSample ? state.bird.y : h / 2;
             clusters.sort((a, b) => Math.abs(a.y - anchorY) - Math.abs(b.y - anchorY));
             const best = clusters[0];
 
+            debugLog(`Bird sample: (${best.x.toFixed(0)}, ${best.y.toFixed(0)}) size=${best.size} [${clusters.length} clusters]`);
             return { x: best.x, y: best.y, size: best.size, clusterCount: clusters.length };
         } catch (e) {
             debugLog(`Canvas error: ${e.message}`);
