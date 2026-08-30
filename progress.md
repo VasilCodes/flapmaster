@@ -252,7 +252,7 @@ Two categories of bugs made the bot completely non-functional:
 | 10 pipes | 0% | 70% | 65% | 52% |
 | 20 pipes | 0% | 45% | 31% | 16% |
 
-### v6.2 (2026-08-31) — Planner speed fix + pipe detection improvements
+### v6.2 (2026-08-31) — Planner speed fix + pipe detection improvements + debug overlay
 
 **Bug fixes:**
 - `rolloutFlapAt` in the live bot used constant `d.speed` for pipe movement
@@ -265,13 +265,22 @@ Two categories of bugs made the bot completely non-functional:
   recent ones (< 800ms), keep using cached pipes so the planner doesn't
   lose its target during brief detection drops.
 
-**Empirical results (headless, 300 games, 1% miss):**
+**Pipe detection rewrite:**
+- Rewrote `readPipes` to group nearby x-columns into pipe candidates,
+  then find the largest gap in each candidate. More robust than the old
+  per-column approach.
+- Widened detection criteria: brightness < 120 AND greenish (g > r * 0.6)
+- Scan every 3px horizontally (was 4px) for better resolution
+- Added debug overlay: when debug mode is on, draws gap lines + center
+  dots on the canvas so you can see what the bot detects
+
+**Empirical results (headless, 500 games, 1% miss):**
 
 | Target | chill | pump | degen |
 |--------|-------|------|-------|
-| 3 pipes | 97% | 96% | 93% |
-| 5 pipes | 89% | 85% | 78% |
-| 10 pipes | 70% | 63% | 48% |
+| 3 pipes | 96% | 95% | 90% |
+| 5 pipes | 90% | 85% | 77% |
+| 10 pipes | 72% | 64% | 48% |
 
 ### v5.4 (2026-08-30)
 **Removed non-working features:**
