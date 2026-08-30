@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FlapMaster – Auto-Flap Bot (GreenPump)
 // @namespace    http://tampermonkey.net/
-// @version      6.3
+// @version      6.4
 // @description  Auto-flap bot. Detects bird position via canvas, flaps and cashes out with keyboard simulation.
 // @author       zavko & limerence
 // @match        https://greenpump.xyz/flappy*
@@ -693,20 +693,29 @@
         const birdVY = state.bird.vy;
         debugLog(`birdY=${birdY.toFixed(0)} vy=${birdVY.toFixed(1)} pipes=${pipesAhead.length}`);
 
-        // The planner decides every frame and is naturally self-limiting:
-        // flapping sets vy negative, so "coast" wins the next rollout and
-        // we don't flap again until actually falling.
         const spd = config.speed + Math.min(0.55, 0.028 * state.currentScore);
         const shouldFlap = botShouldFlap(birdY, birdVY, pipesAhead, config, spd);
 
-        if (shouldFlap) {
+        // SAFETY: if bird is in the top 25% of the screen AND rising,
+        // NEVER flap. This prevents "goes up nonstop" regardless of
+        // what the planner/heuristic decides.
+        const tooHigh = birdY < (GROUND_Y * 0.25) && birdVY < 0;
+
+        // HARD COOLDOWN: never flap more than once per MIN_FLAP_INTERVAL ms.
+        const MIN_FLAP_INTERVAL = 150; // ms (~9 frames at 60fps)
+
+        if (shouldFlap && !tooHigh) {
             if (Math.random() < missChance) {
                 debugLog('Miss chance - skip flap');
-            } else {
+            } else if (now - state.lastFlapTime >= MIN_FLAP_INTERVAL) {
                 simulateKey(' ');
                 state.bird.vy = config.jumpForce;
                 state.lastFlapTime = now;
+            } else {
+                debugLog(`Flap blocked by cooldown (${now - state.lastFlapTime}ms < ${MIN_FLAP_INTERVAL}ms)`);
             }
+        } else if (tooHigh) {
+            debugLog(`Flap blocked: too high (y=${birdY.toFixed(0)} vy=${birdVY.toFixed(1)})`);
         }
 
         // Debug overlay: draw detected pipes on the canvas
@@ -870,7 +879,7 @@
         panel.id = 'flapper-panel';
         panel.innerHTML = `
             <div class="drag-handle" id="fp-drag-handle">
-                <div class="header">FLAPMASTER <span class="badge">v6.3</span></div>
+                <div class="header">FLAPMASTER <span class="badge">v6.4</span></div>
                 <div style="display:flex;gap:4px;align-items:center;">
                     <button class="minimize-btn" id="fp-minimize" title="Minimize">-</button>
                     <span style="color:#4ade80;font-size:12px;opacity:0.5;">⠿</span>
@@ -1054,7 +1063,7 @@
 
     // ==================== INIT ====================
     function init() {
-        log('FlapMaster v6.3 initializing...');
+        log('FlapMaster v6.4 initializing...');
         canvas = findCanvas();
         if (canvas) {
             ctx = canvas.getContext('2d', { willReadFrequently: true });
