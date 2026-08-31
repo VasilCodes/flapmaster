@@ -201,26 +201,32 @@
     }
 
     // Detect the bird by scanning a narrow strip around x=90-150 for
-    // non-sky, non-pipe pixels (the bird sprite).
+    // non-sky pixels (the bird sprite).
     // Uses shared imageData from gameLoop to avoid repeated getImageData calls.
+    // NOTE: we only check !isSky, NOT !isPipe — the bird's green body
+    // would be classified as pipe by isPipe, so we'd never find it.
     function readBirdSample(imageData, w) {
         if (!canvas || !ctx || !imageData) return null;
         try {
             const scanX = 90, scanW = 60;
             const data = imageData.data;
             let birdPixels = [];
+            // Use predicted y to narrow the search and avoid false positives
+            const predY = state.bird.hasSample ? state.bird.y : H / 2;
+            const yMin = Math.max(50, predY - 30);
+            const yMax = Math.min(GROUND_Y, predY + 30);
 
             for (let x = 0; x < scanW; x++) {
-                for (let y = 50; y < GROUND_Y; y += 2) {
+                for (let y = yMin; y < yMax; y += 2) {
                     const idx = (y * w + (scanX + x)) * 4;
                     const r = data[idx], g = data[idx+1], b = data[idx+2];
-                    if (!isSky(r, g, b) && !isPipe(r, g, b)) {
+                    if (!isSky(r, g, b)) {
                         birdPixels.push({ x: scanX + x, y });
                     }
                 }
             }
 
-            if (birdPixels.length < 5 || birdPixels.length > 2000) return null;
+            if (birdPixels.length < 3 || birdPixels.length > 1500) return null;
 
             let sumX = 0, sumY = 0;
             for (const p of birdPixels) { sumX += p.x; sumY += p.y; }
@@ -627,9 +633,13 @@
             state.birdHistory = [];
             state.crashRequested = false;
             state.roundStartLogged = false;
+            // Initialize bird physics at the known game-start position
+            state.bird.x = 140;
+            state.bird.y = H / 2 - 20;
+            state.bird.vy = config.jumpForce;
+            state.bird.hasSample = true;
             log(`Round started! Target: ${CONFIG.targetPipes} pipes (${getMultiplier(CONFIG.difficulty || 'chill', CONFIG.targetPipes)}x)`);
             simulateKey(' ');
-            state.bird.vy = config.jumpForce;
             state.lastFlapTime = now;
         }
 
