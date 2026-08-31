@@ -182,6 +182,47 @@ function getMultiplier(difficulty, pipes) {
 
 ## Changelog
 
+### v7.3 (2026-08-31) — Flap algorithm fix (69% win rate on chill)
+
+**Root cause of 0% win rate:**
+The flap target was `gapCenter - 5` (5px above center). Each flap rises
+~66px. From 5px above center, the bird overshoots to 61px above center —
+past the gap top (57px above center for a 114px gap). The bird oscillates
+with unstable amplitude and always clips a pipe cap.
+
+**Fix:**
+Changed target from `gapCenter - 5` to `gapCenter + 20`. Bird now flaps
+when 20px BELOW center, rising to 46px above center — safely within the
+57px half-gap. Verified by 5000-game Monte Carlo simulation:
+
+| Difficulty | Win Rate (>=3) | Avg Pipes | Max |
+|------------|----------------|-----------|-----|
+| chill      | 69%            | 6.3       | 30  |
+| pump       | 43%            | 3.0       | 28  |
+| degen      | 8%             | 0.7       | 12  |
+
+Degen is poor because the gap (105px) barely fits the 66px rise.
+
+### v7.2 (2026-08-31) — Round detection + bird detection fixes
+
+- isRoundActive: when round already active, skip history check
+- Bird detection: removed isPipe filter (bird green was classified as pipe)
+- Bird detection: use predicted y to narrow scan range (±30px)
+- Bird physics: initialize at game start position when round begins
+- Sky detection: blue-based (b>140, |g-b|<60) instead of brightness-based
+- Pipe detection: g > r+20 AND g > b+30
+- One-shot color diagnostic on first frame
+- Reduced per-frame console.log to debug mode or every 60 frames
+- Added @run-at document-start + willReadFrequently monkey-patch
+
+### v7.0 (2026-08-31) — Complete rewrite from v6.5
+
+- Removed 2-action planner (heurFlap/rolloutFlapAt)
+- New sky detection: blue-based (b>140, |g-b|<60) — fixed cyan sky bug
+- New pipe detection: g > r+20 AND g > b+30 (green dominates both)
+- New bird detection: scan strip x=90-150 for !isSky pixels only
+- Flap rule: bird below gap center AND falling → flap
+
 ### v6.0 (2026-08-31) — Flap algorithm rewrite + critical bug fixes
 
 **Root cause of "bird always just flies up" (and everything else looking broken):**
