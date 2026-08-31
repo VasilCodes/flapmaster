@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FlapMaster – Auto-Flap Bot (GreenPump)
 // @namespace    http://tampermonkey.net/
-// @version      7.1
+// @version      7.2
 // @description  Auto-flap bot. Detects bird position via canvas, flaps and cashes out with keyboard simulation.
 // @author       zavko & limerence
 // @match        https://greenpump.xyz/flappy*
@@ -99,23 +99,25 @@
         return (d.jumpForce * d.jumpForce) / (2 * d.gravity);
     }
 
-    // Is this pixel sky-colored? Sky in greenpump is cyan gradient:
-    // #4ec0ca (78,204,202) to #8edde4 (142,221,228)
-    // Sky = high R, high G, high B, and G≈R (cyan).
+    // Sky detection: the sky is CYAN — both green AND blue are high and
+    // close to each other. Real values: #4ec0ca (78,204,202) to
+    // #8edde4 (142,221,228). Key: b > 140 and |g-b| < 60.
     function isSky(r, g, b) {
-        const brightness = (r + g + b) / 3;
-        // Sky is bright and cyan-ish: all channels > 120, G and R close
-        if (brightness > 140 && g > 120 && b > 120 && Math.abs(g - r) < 80) return true;
-        return false;
+        if (b < 140) return false;
+        if (g < 100) return false;
+        if (Math.abs(g - b) > 60) return false;
+        return true;
     }
 
-    // Is this pixel pipe-colored? Pipe stripes are bright green where G >> R.
+    // Pipe detection: pipes are GREEN — green dominates both red AND blue.
+    // Real values: #a3e048 (163,224,72), #8cd600 (140,214,0),
+    // #558b2f (85,139,47), #3d661b (61,102,27).
+    // Key: g > r + 20 AND g > b + 30. Blue is always LOW on pipes.
     function isPipe(r, g, b) {
-        // Bright pipe stripe: green dominates red
-        if (g > r + 20 && g > 50) return true;
-        // Dark pipe outline: very dark and greenish
-        if (r < 80 && g < 120 && g > r && (r + g + b) / 3 < 80) return true;
-        return false;
+        if (g <= r + 20) return false;
+        if (g <= b + 30) return false;
+        if (g < 40) return false;
+        return true;
     }
 
     // Scan ONE horizontal line near the top of the canvas for pipe columns.
@@ -363,6 +365,9 @@
     }
 
     // ==================== ROUND DETECTION ====================
+    // Two modes:
+    // 1. Not yet in a round: accumulate bird history, detect movement
+    // 2. Already in a round: just check for game over, keep going
     function isRoundActive(hasSample) {
         if (isOverlayVisible()) {
             if (!state.overlayDetected) {
@@ -376,12 +381,25 @@
             log('Overlay gone - waiting for bird...');
         }
 
-        // Check for game over
+        // Check for game over elements
         for (const sel of ['.game-over', '[class*="gameover"]', '[class*="crashed"]']) {
             const el = document.querySelector(sel);
             if (el && getComputedStyle(el).display !== 'none') return false;
         }
 
+        // ALREADY IN A ROUND: keep going as long as we have a bird sample.
+        // Don't require history — the round was already confirmed.
+        if (state.roundActive) {
+            if (!hasSample) {
+                state.detectionFrames++;
+                if (state.detectionFrames > 30) return false; // lost bird for 30 frames → round over
+            } else {
+                state.detectionFrames = 0;
+            }
+            return true;
+        }
+
+        // NOT YET IN A ROUND: need bird sample + movement to confirm.
         if (!hasSample) {
             state.detectionFrames++;
             if (state.detectionFrames > 60) return false;
@@ -538,6 +556,7 @@
     }
 
     // ==================== GAME LOOP ====================
+    let _colorDumpDone = false;
     function gameLoop() {
         if (!state.running) {
             requestAnimationFrame(gameLoop);
@@ -555,6 +574,38 @@
             } catch (e) { /* ignore */ }
         }
         const w = canvas ? canvas.width : 940;
+
+        // One-shot color diagnostic: dump actual pixel values at key positions
+        if (imageData && !_colorDumpDone) {
+            _colorDumpDone = true;
+            const data = imageData.data;
+            log('=== COLOR DIAGNOSTIC ===');
+            // Sample y=5 (pipe scan line) at several x positions
+            for (const sx of [0, 50, 120, 200, 300, 400, 500, 600, 700, 800, 900]) {
+                const idx = (5 * w + sx) * 4;
+                const r = data[idx], g = data[idx+1], b = data[idx+2];
+                const sky = isSky(r, g, b);
+                const pipe = isPipe(r, g, b);
+                console.log(`[FM-DIAG] y=5 x=${sx}: rgb(${r},${g},${b}) sky=${sky} pipe=${pipe}`);
+            }
+            // Sample y=200 (mid-screen)
+            for (const sx of [0, 50, 120, 200, 300, 400, 500, 600, 700, 800, 900]) {
+                const idx = (200 * w + sx) * 4;
+                const r = data[idx], g = data[idx+1], b = data[idx+2];
+                const sky = isSky(r, g, b);
+                const pipe = isPipe(r, g, b);
+                console.log(`[FM-DIAG] y=200 x=${sx}: rgb(${r},${g},${b}) sky=${sky} pipe=${pipe}`);
+            }
+            // Sample bird area x=100-140, y=100-400
+            for (const sy of [100, 150, 200, 250, 300, 350, 400]) {
+                const idx = (sy * w + 120) * 4;
+                const r = data[idx], g = data[idx+1], b = data[idx+2];
+                const sky = isSky(r, g, b);
+                const pipe = isPipe(r, g, b);
+                console.log(`[FM-DIAG] y=${sy} x=120: rgb(${r},${g},${b}) sky=${sky} pipe=${pipe}`);
+            }
+            log('Color diagnostic printed to console (F12)');
+        }
 
         const birdSample = readBirdSample(imageData, w);
         updateBirdPhysics(birdSample, config);
@@ -607,11 +658,14 @@
         // SAFETY: ground emergency
         const tooLow = birdY > (GROUND_Y - BIRD_RADIUS - 40);
 
-        // Log EVERY frame to browser console so user can paste output
+        // Log status — debug mode logs every frame, otherwise every 60 frames
         const pipeInfo = pipesAhead.length > 0
             ? pipesAhead.map(p => `x=${p.x.toFixed(0)} gap=${p.gapTop.toFixed(0)}-${p.gapBottom.toFixed(0)}`).join('; ')
             : 'NONE';
-        console.log(`[FM] y=${birdY.toFixed(0)} vy=${birdVY.toFixed(1)} pipes=[${pipeInfo}] score=${state.currentScore} tooHigh=${tooHigh} tooLow=${tooLow}`);
+        state._frameCount = (state._frameCount || 0) + 1;
+        if (CONFIG.debugMode || state._frameCount % 60 === 0) {
+            console.log(`[FM] y=${birdY.toFixed(0)} vy=${birdVY.toFixed(1)} pipes=[${pipeInfo}] score=${state.currentScore} birdSample=${!!birdSample}`);
+        }
 
         let shouldFlap = false;
         if (tooLow) {
@@ -980,7 +1034,7 @@
 
     // ==================== INIT ====================
     function init() {
-        log('FlapMaster v7.1 initializing...');
+        log('FlapMaster v7.2 initializing...');
         canvas = findCanvas();
         if (canvas) {
             ctx = canvas.getContext('2d');
